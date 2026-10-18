@@ -39,6 +39,11 @@ static __always_inline struct varint_value varint(__s32 value, __u32 bytes)
 // into result, and return from the enclosing function once the continuation
 // bit ends. Must be a macro because it returns/jumps on behalf of its caller;
 // the manual unrolling keeps the parse loop verifier-friendly.
+//
+// Note: the folded value is *not* verifier-bounded (bitwise OR of precise
+// scalars yields an unknown scalar). Anything that uses the value as a packet
+// pointer offset must bound it first - see SKIP_IN_RANGE_OR_RETURN in
+// common.h, which does exactly that and explains the failure mode in detail.
 #define VARINT_BYTE(ptr, pend, dend, max, idx, shift, result)    \
     do                                                           \
     {                                                            \

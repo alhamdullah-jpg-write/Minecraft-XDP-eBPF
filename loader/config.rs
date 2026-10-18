@@ -39,6 +39,21 @@ player_idle_timeout_secs = 60
 # false -> allow the protocol maximum (offline / cracked servers).
 online_names = true
 
+# Dry run: never actually drop anything, only count (and log) the drops the
+# filter would have made. Use it to tune the configuration on a live server
+# without risking legitimate players, then turn it off.
+dry_run = false
+
+# Drop packets whose source address can never be a real client: 0/8,
+# 169.254/16, multicast (224/4) and reserved space (240/4). Recommended;
+# these are either always forged or never routable.
+drop_reserved_sources = true
+
+# Additionally drop packets from private ranges (RFC1918, loopback, CGNAT
+# 100.64/10). Leave this off when proxies, monitoring hosts or other servers
+# on the same private network legitimately connect to the protected port.
+drop_private_sources = false
+
 [xdp]
 # How the filter attaches to the network interface.
 # "auto"   -> native driver mode if the NIC supports XDP, with automatic
@@ -64,6 +79,20 @@ max_player_connections = 65535
 # Source IPs tracked by the SYN throttle. When the table is full, new SYNs
 # are dropped (fail closed) until expired windows are reclaimed in-kernel.
 max_throttled_ips = 65535
+
+# Optional file with source addresses that bypass all inspection. One entry
+# per line, IPv4 address or CIDR ("8.8.8.8", "10.0.0.0/8"); empty lines and
+# '#' comments are ignored. The file is read at start and re-read on SIGHUP
+# (kill -HUP <pid>).
+#
+# Only use this for infrastructure you control: source addresses can be
+# spoofed unless your upstream provider filters them (uRPF/BCP38), and an
+# allowlisted address skips the throttle and the stateful checks.
+# allowlist_file = "/etc/minecraft-xdp/allowlist.txt"
+
+# Capacity of the allowlist table; the loader refuses a file with more
+# entries than this instead of silently truncating it.
+max_allowlist_entries = 4096
 
 [metrics]
 # Collect packet statistics inside the eBPF program. Required for any metrics
@@ -122,6 +151,15 @@ pub struct FilterConfig {
     pub player_idle_timeout_secs: u64,
     /// Enforce online-mode (<= 16 char) usernames. Maps to `ONLINE_NAMES`.
     pub online_names: bool,
+    /// Count (and log) drops without enforcing them. Maps to `DRY_RUN`.
+    pub dry_run: bool,
+    /// Drop sources from 0/8, 169.254/16, multicast and reserved space.
+    /// Maps to `DROP_RESERVED_SOURCES`.
+    pub drop_reserved_sources: bool,
+    /// Also drop sources from RFC1918, loopback and CGNAT. Maps to
+    /// `DROP_PRIVATE_SOURCES`; off by default so same-host proxies and LAN
+    /// monitoring keep working.
+    pub drop_private_sources: bool,
 }
 
 impl Default for FilterConfig {
@@ -133,6 +171,9 @@ impl Default for FilterConfig {
             hit_count_reset_secs: 3,
             player_idle_timeout_secs: 60,
             online_names: true,
+            dry_run: false,
+            drop_reserved_sources: true,
+            drop_private_sources: false,
         }
     }
 }
@@ -154,6 +195,11 @@ pub struct XdpConfig {
     /// Capacity of `connection_throttle`: source IPs with an active throttle
     /// window.
     pub max_throttled_ips: u32,
+    /// Optional file with source addresses (IPv4 or CIDR, one per line) that
+    /// bypass all inspection; re-read on SIGHUP.
+    pub allowlist_file: Option<String>,
+    /// Capacity of `allowlist_map`.
+    pub max_allowlist_entries: u32,
 }
 
 impl Default for XdpConfig {
@@ -163,6 +209,8 @@ impl Default for XdpConfig {
             max_pending_connections: 16384,
             max_player_connections: 65535,
             max_throttled_ips: 65535,
+            allowlist_file: None,
+            max_allowlist_entries: 4096,
         }
     }
 }
@@ -346,7 +394,19 @@ impl XdpConfig {
             self.max_throttled_ips as u64,
             1,
             MAX_ENTRIES,
-        )
+        )?;
+        check_range(
+            "[xdp] max_allowlist_entries",
+            self.max_allowlist_entries as u64,
+            1,
+            MAX_ENTRIES,
+        )?;
+        if let Some(path) = &self.allowlist_file {
+            if path.trim().is_empty() {
+                bail!("[xdp] allowlist_file must not be empty (remove the option to disable it)");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -441,10 +501,36 @@ mod tests {
             "max_pending_connections",
             "max_player_connections",
             "max_throttled_ips",
+            "max_allowlist_entries",
         ] {
             let cfg: Config = toml::from_str(&format!("[xdp]\n{option} = 0")).unwrap();
             assert!(cfg.validate().is_err(), "{option} = 0 must be rejected");
         }
+    }
+
+    #[test]
+    fn hardened_defaults_are_safe() {
+        let cfg = Config::default();
+        assert!(!cfg.filter.dry_run, "dry run must be opt-in");
+        assert!(
+            cfg.filter.drop_reserved_sources,
+            "reserved source filtering is safe and on by default"
+        );
+        assert!(
+            !cfg.filter.drop_private_sources,
+            "private sources must stay allowed (same-host proxies)"
+        );
+        assert!(cfg.xdp.allowlist_file.is_none());
+    }
+
+    #[test]
+    fn allowlist_file_is_validated() {
+        let cfg: Config = toml::from_str("[xdp]\nallowlist_file = \"  \"").unwrap();
+        assert!(cfg.validate().is_err());
+
+        let cfg: Config = toml::from_str("[xdp]\nallowlist_file = \"/etc/mc/allow.txt\"").unwrap();
+        assert_eq!(cfg.xdp.allowlist_file.as_deref(), Some("/etc/mc/allow.txt"));
+        cfg.validate().unwrap();
     }
 
     #[test]

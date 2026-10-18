@@ -713,6 +713,157 @@ static void test_login_rejects_length_mismatch(void)
     CHECK(run_login(pkt.b, pkt.n, 765) == 0);
 }
 
+/* ------------------------------------------------------------------------
+ * Stateless sanity helpers (common.h)
+ * --------------------------------------------------------------------- */
+
+static void test_ipv4_source_classification(void)
+{
+    // reserved sources: never a legitimate client
+    const __u32 reserved[] = {
+        0x00000000u, // 0.0.0.0
+        0x00000001u, // 0.0.0.1 (0/8)
+        0x00FFFFFFu, // 0.255.255.255
+        0xA9FE0001u, // 169.254.0.1 (link local)
+        0xA9FEFFFFu, // 169.254.255.255
+        0xE0000001u, // 224.0.0.1 (multicast)
+        0xFFFFFFFFu, // 255.255.255.255 (240/4)
+    };
+    for (__u32 i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++)
+    {
+        CHECK(ipv4_is_reserved_src(reserved[i]) == 1);
+    }
+
+    CHECK(ipv4_is_reserved_src(0x08080808u) == 0); // 8.8.8.8
+    CHECK(ipv4_is_reserved_src(0x01020304u) == 0); // 1.2.3.4
+    CHECK(ipv4_is_reserved_src(0xA9FF0001u) == 0); // 169.255.0.1, not link local
+    CHECK(ipv4_is_reserved_src(0xDFFFFFFFu) == 0); // 223.255.255.255, below 224/4
+
+    // private sources: only flagged by the optional check
+    const __u32 private[] = {
+        0x7F000001u, // 127.0.0.1
+        0x0A000001u, // 10.0.0.1
+        0xAC100001u, // 172.16.0.1
+        0xAC1FFFFFu, // 172.31.255.255
+        0xC0A80101u, // 192.168.1.1
+        0x64400001u, // 100.64.0.1 (cgnat)
+        0x647FFFFFu, // 100.127.255.255
+    };
+    for (__u32 i = 0; i < sizeof(private) / sizeof(private[0]); i++)
+    {
+        CHECK(ipv4_is_private_src(private[i]) == 1);
+    }
+
+    CHECK(ipv4_is_private_src(0x0B000001u) == 0); // 11.0.0.1
+    CHECK(ipv4_is_private_src(0xAC0F0001u) == 0); // 172.15.0.1, just outside
+    CHECK(ipv4_is_private_src(0xAC200001u) == 0); // 172.32.0.1, just outside
+    CHECK(ipv4_is_private_src(0x643F0001u) == 0); // 100.63.0.1, below cgnat
+    CHECK(ipv4_is_private_src(0x64800001u) == 0); // 100.128.0.1, above cgnat
+    CHECK(ipv4_is_private_src(0xC0A90101u) == 0); // 192.169.1.1
+    CHECK(ipv4_is_private_src(0x08080808u) == 0); // 8.8.8.8
+}
+
+static struct tcphdr tcp_with_flags(__u8 syn, __u8 ack, __u8 fin, __u8 rst, __u8 urg)
+{
+    struct tcphdr tcp = {0};
+    tcp.syn = syn;
+    tcp.ack = ack;
+    tcp.fin = fin;
+    tcp.rst = rst;
+    tcp.urg = urg;
+    return tcp;
+}
+
+static void test_tcp_flags_plausible(void)
+{
+    // flag combinations a client sends
+    struct tcphdr tcp = tcp_with_flags(1, 0, 0, 0, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 1); // SYN
+    tcp = tcp_with_flags(0, 1, 0, 0, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 1); // ACK
+    tcp = tcp_with_flags(0, 0, 1, 0, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 1); // FIN
+    tcp = tcp_with_flags(0, 0, 0, 1, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 1); // RST
+    tcp = tcp_with_flags(0, 1, 1, 0, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 1); // ACK+FIN (normal close)
+    tcp = tcp_with_flags(0, 1, 0, 0, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 1); // ACK + data
+
+    // combinations that are always forged or broken
+    tcp = tcp_with_flags(0, 0, 0, 0, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 0); // NULL scan
+    tcp = tcp_with_flags(1, 1, 0, 0, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 0); // SYN+ACK (server side only)
+    tcp = tcp_with_flags(1, 0, 1, 0, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 0); // SYN+FIN
+    tcp = tcp_with_flags(1, 0, 0, 1, 0);
+    CHECK(tcp_flags_are_plausible(&tcp) == 0); // SYN+RST
+    tcp = tcp_with_flags(0, 1, 0, 0, 1);
+    CHECK(tcp_flags_are_plausible(&tcp) == 0); // URG
+}
+
+/* ------------------------------------------------------------------------
+ * Range-checked variable skip (common.h)
+ * --------------------------------------------------------------------- */
+
+static __u8 wrap_skip_in_range(const __u8 **cursor, __s32 *value, __u32 min, __u32 max, __u32 mask,
+                               const __u8 *pend, const void *dend)
+{
+    SKIP_IN_RANGE_OR_RETURN(*cursor, *value, min, max, mask, pend, dend);
+    return 1;
+}
+
+static void test_skip_in_range_macro(void)
+{
+    __u8 *heap = malloc(64);
+    const __u8 *pend = heap + 64;
+
+    // an in-range value is used verbatim and advances the cursor
+    const __u8 *cursor = heap;
+    __s32 value = 16;
+    CHECK(wrap_skip_in_range(&cursor, &value, 1, 765, 0x3ff, pend, pend) == 1);
+    CHECK(cursor == heap + 16);
+    CHECK(value == 16);
+
+    // both bounds bind
+    cursor = heap;
+    value = 0;
+    CHECK(wrap_skip_in_range(&cursor, &value, 1, 765, 0x3ff, pend, pend) == 0);
+    cursor = heap;
+    value = 766;
+    CHECK(wrap_skip_in_range(&cursor, &value, 1, 765, 0x3ff, pend, pend) == 0);
+
+    // 0 is allowed where min is 0 (key/signature skips)
+    cursor = heap;
+    value = 0;
+    CHECK(wrap_skip_in_range(&cursor, &value, 0, 512, 0x3ff, pend, pend) == 1);
+    CHECK(cursor == heap);
+
+    // the payload_end bound binds even when data_end leaves room
+    cursor = heap;
+    value = 8;
+    CHECK(wrap_skip_in_range(&cursor, &value, 1, 765, 0x3ff, heap + 4, heap + 64) == 0);
+
+    // exact fit against payload_end
+    cursor = heap;
+    value = 8;
+    CHECK(wrap_skip_in_range(&cursor, &value, 1, 765, 0x3ff, heap + 8, heap + 64) == 1);
+    CHECK(cursor == heap + 8);
+
+    // the mask can only ever reduce the value, never inflate it
+    CHECK(SKIP_MASK(0) == 0x3f);
+    CHECK(SKIP_MASK(16) == 0x3f);
+    CHECK(SKIP_MASK(48) == 0x3f);
+    CHECK(SKIP_MASK(255) == 0xff);
+    CHECK(SKIP_MASK(256) == 0x3ff);
+    CHECK(SKIP_MASK(765) == 0x3ff);
+    CHECK(SKIP_MASK(512) == 0x3ff);
+    CHECK(SKIP_MASK(4096) == 0x1fff);
+
+    free(heap);
+}
+
 /* --------------------------------------------------------------------- */
 
 int main(void)
@@ -738,6 +889,9 @@ int main(void)
     test_login_1_19_key_block();
     test_login_uuid_eras();
     test_login_rejects_length_mismatch();
+    test_ipv4_source_classification();
+    test_tcp_flags_plausible();
+    test_skip_in_range_macro();
 
     printf("%u checks, %u failures\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;

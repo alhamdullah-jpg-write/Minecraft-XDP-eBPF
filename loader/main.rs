@@ -1,3 +1,4 @@
+mod allowlist;
 mod config;
 mod ebpf;
 mod logging;
@@ -131,17 +132,30 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
         .as_deref()
         .context("interface is required unless --license is specified")?;
 
+    // Parse the allowlist before attaching anything: a misconfigured file
+    // must stop the loader, not leave a half-configured filter running.
+    let allowlist = match &config.xdp.allowlist_file {
+        Some(path) => Some(allowlist::Allowlist::load(Path::new(path))?),
+        None => None,
+    };
+
     // keep the handle alive until the end of this function: dropping it
     // detaches the XDP program
     let mut ebpf = ebpf::load_and_attach(interface, config)?;
+    let allowlist_thread = allowlist::start(&mut ebpf, config, allowlist, shutdown)?;
     let stats_thread = metrics::start(&mut ebpf, config, shutdown)?;
 
     shutdown.wait();
 
-    if let Some(handle) = stats_thread {
-        handle
-            .join()
-            .map_err(|e| anyhow::anyhow!("track-stats thread panicked: {e:?}"))?;
+    for (thread, handle) in [
+        ("allowlist", allowlist_thread),
+        ("track-stats", stats_thread),
+    ] {
+        if let Some(handle) = handle {
+            handle
+                .join()
+                .map_err(|e| anyhow::anyhow!("{thread} thread panicked: {e:?}"))?;
+        }
     }
     Ok(())
 }

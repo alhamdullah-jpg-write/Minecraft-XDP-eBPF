@@ -33,10 +33,18 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
     let hit_count: u32 = filter.hit_count;
     let hit_count_reset_ns: u64 = filter.hit_count_reset_secs * 1_000_000_000;
     let player_idle_ns: u64 = filter.player_idle_timeout_secs * 1_000_000_000;
+    let dry_run: u8 = filter.dry_run as u8;
+    let drop_reserved_sources: u8 = filter.drop_reserved_sources as u8;
+    let drop_private_sources: u8 = filter.drop_private_sources as u8;
+    let allowlist_enabled: u8 = config.xdp.allowlist_file.is_some() as u8;
 
     let mut ebpf = EbpfLoader::new()
         .override_global("PROMETHEUS", &prometheus, true)
         .override_global("ONLINE_NAMES", &online_names, true)
+        .override_global("DRY_RUN", &dry_run, true)
+        .override_global("DROP_RESERVED_SOURCES", &drop_reserved_sources, true)
+        .override_global("DROP_PRIVATE_SOURCES", &drop_private_sources, true)
+        .override_global("ALLOWLIST_ENABLED", &allowlist_enabled, true)
         .override_global("START_PORT", &start_port, true)
         .override_global("END_PORT", &end_port, true)
         .override_global("HIT_COUNT", &hit_count, true)
@@ -49,6 +57,7 @@ pub fn load_and_attach(interface: &str, config: &Config) -> Result<Ebpf> {
         .map_max_entries("conntrack_map", config.xdp.max_pending_connections)
         .map_max_entries("player_connection_map", config.xdp.max_player_connections)
         .map_max_entries("connection_throttle", config.xdp.max_throttled_ips)
+        .map_max_entries("allowlist_map", config.xdp.max_allowlist_entries)
         .load(object)
         .context("failed to load BPF program")?;
 

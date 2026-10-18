@@ -95,8 +95,7 @@ static __always_inline __s32 inspect_handshake(const __u8 *cursor, const __u8 *p
 
     // host length, then skip the host data
     READ_VARINT_OR_RETURN(varint, cursor, payload_end, data_end, VARINT_SIZE(HANDSHAKE_HOST_DATA_MAX));
-    ASSERT_IN_RANGE_OR_RETURN(varint.value, HANDSHAKE_HOST_DATA_MIN, HANDSHAKE_HOST_DATA_MAX);
-    SKIP_OR_RETURN(cursor, varint.value, payload_end, data_end);
+    SKIP_IN_RANGE_OR_RETURN(cursor, varint.value, HANDSHAKE_HOST_DATA_MIN, HANDSHAKE_HOST_DATA_MAX, SKIP_MASK(HANDSHAKE_HOST_DATA_MAX), payload_end, data_end);
 
     // server port
     SKIP_OR_RETURN(cursor, HANDSHAKE_PORT_LEN, payload_end, data_end);
@@ -182,8 +181,7 @@ static __always_inline __u8 inspect_login_packet(const __u8 *cursor, const __u8 
 
     // username length, then skip the username data
     READ_VARINT_OR_RETURN(varint, cursor, payload_end, data_end, VARINT_SIZE(ONLINE_NAMES ? 16 : LOGIN_NAME_DATA_MAX));
-    ASSERT_IN_RANGE_OR_RETURN(varint.value, LOGIN_NAME_DATA_MIN, ONLINE_NAMES ? 16 : LOGIN_NAME_DATA_MAX);
-    SKIP_OR_RETURN(cursor, varint.value, payload_end, data_end);
+    SKIP_IN_RANGE_OR_RETURN(cursor, varint.value, LOGIN_NAME_DATA_MIN, ONLINE_NAMES ? 16 : LOGIN_NAME_DATA_MAX, SKIP_MASK(ONLINE_NAMES ? 16 : LOGIN_NAME_DATA_MAX), payload_end, data_end);
 
     // optional chat signing key, 1.19 (759) up to 1.19.3 (761)
     if (protocol_version >= 759 && protocol_version < 761)
@@ -197,13 +195,11 @@ static __always_inline __u8 inspect_login_packet(const __u8 *cursor, const __u8 
 
             // public key length, then skip the key
             READ_VARINT_OR_RETURN(varint, cursor, payload_end, data_end, VARINT_SIZE(LOGIN_KEY_MAX));
-            ASSERT_IN_RANGE_OR_RETURN(varint.value, LOGIN_KEY_MIN, LOGIN_KEY_MAX);
-            SKIP_OR_RETURN(cursor, varint.value, payload_end, data_end);
+            SKIP_IN_RANGE_OR_RETURN(cursor, varint.value, LOGIN_KEY_MIN, LOGIN_KEY_MAX, SKIP_MASK(LOGIN_KEY_MAX), payload_end, data_end);
 
             // signature length, then skip the signature
             READ_VARINT_OR_RETURN(varint, cursor, payload_end, data_end, VARINT_SIZE(LOGIN_SIGNATURE_MAX));
-            ASSERT_IN_RANGE_OR_RETURN(varint.value, LOGIN_SIGNATURE_MIN, LOGIN_SIGNATURE_MAX);
-            SKIP_OR_RETURN(cursor, varint.value, payload_end, data_end);
+            SKIP_IN_RANGE_OR_RETURN(cursor, varint.value, LOGIN_SIGNATURE_MIN, LOGIN_SIGNATURE_MAX, SKIP_MASK(LOGIN_SIGNATURE_MAX), payload_end, data_end);
         }
     }
 

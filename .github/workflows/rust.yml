@@ -30,6 +30,10 @@ jobs:
       run: rustup target add x86_64-unknown-linux-musl
     - name: Run tests
       run: cargo test --verbose
+    - name: Verifier check (loads the object into the running kernel)
+      # exit 3 means the CI environment cannot load XDP programs (not root,
+      # no XDP support); any other failure is a real verifier/compile failure
+      run: ./xdp/tests/verifier_load.sh || [ $? -eq 3 ]
     - name: Build
       run: |
         cargo build --release --target x86_64-unknown-linux-musl
