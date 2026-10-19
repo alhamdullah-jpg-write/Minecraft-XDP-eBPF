@@ -795,6 +795,7 @@ dependencies = [
  "colored 3.1.1",
  "fern",
  "file-rotate",
+ "libc",
  "log",
  "prometheus",
  "serde",

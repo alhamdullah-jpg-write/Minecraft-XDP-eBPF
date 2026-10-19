@@ -11,6 +11,28 @@
 #define barrier_var(var) asm volatile("" : "+r"(var))
 #endif
 
+/*
+ * Packet bounds check the verifier can rely on.
+ *
+ * `(const void *)(ptr + len) > end` is the idiom used everywhere in this
+ * program, but clang may *prove* such a check redundant from an earlier
+ * check on an equivalent expression (the caller already validated
+ * `payload + payload_len <= data_end`, the callee then checks
+ * `payload + 1`), delete the comparison - and with it the range the
+ * verifier needs for the access that follows. The load is then rejected as
+ * out of bounds even though the C source clearly checked.
+ *
+ * The register barrier makes `ptr` opaque to clang, so the comparison (and
+ * the range the verifier derives from it) always survives. Use this for the
+ * first access to every freshly derived payload pointer.
+ */
+static __always_inline __u8 pkt_within(const void *ptr, const __u32 len, const void *end)
+{
+    const __u8 *p = (const __u8 *)ptr;
+    barrier_var(p);
+    return (const void *)(p + len) <= end;
+}
+
 // maximum amount of out-of-order/retransmitted packets before a tracked
 // connection is dropped entirely
 #define MAX_OUT_OF_ORDER 4
@@ -145,107 +167,8 @@ enum connection_state
             return 0;                            \
     } while (0)
 
-// key identifying one TCP flow (all fields in network byte order)
-struct ipv4_flow_key
-{
-    const __u32 src_ip;
-    const __u32 dst_ip;
-    const __u16 src_port;
-    const __u16 dst_port;
-};
-_Static_assert(sizeof(struct ipv4_flow_key) == 12, "ipv4_flow_key size mismatch!");
-
-// per-connection tracking data while the handshake sequence is inspected
-struct initial_state
-{
-    __u16 state;    // enum connection_state; u16 to keep the struct padding-free
-    __u16 fails;    // out-of-order packets seen so far (see MAX_OUT_OF_ORDER)
-    __s32 protocol; // minecraft protocol version (signed by protocol definition)
-    __u32 expected_sequence;
-};
-_Static_assert(sizeof(struct initial_state) == 12, "initial_state size mismatch!");
-
-static __always_inline struct ipv4_flow_key gen_ipv4_flow_key(const __u32 src_ip, const __u32 dst_ip, const __u16 src_port, const __u16 dst_port)
-{
-    struct ipv4_flow_key key = {
-        .src_ip = src_ip,
-        .dst_ip = dst_ip,
-        .src_port = src_port,
-        .dst_port = dst_port};
-    return key;
-}
-
-static __always_inline struct initial_state gen_initial_state(const __u16 state, const __s32 protocol, const __u32 expected_sequence)
-{
-    struct initial_state new_state = {
-        .state = state,
-        .fails = 0,
-        .protocol = protocol,
-        .expected_sequence = expected_sequence,
-    };
-    return new_state;
-}
-
-/* ------------------------------------------------------------------------
- * Stateless packet sanity checks
- *
- * All host-order where noted; kept header-only (not in the XDP translation
- * unit) so the native unit tests can exercise them directly.
- * --------------------------------------------------------------------- */
-
-/*
- * Source addresses that can never belong to a legitimate client, in host
- * byte order:
- *   - 0.0.0.0/8       "this network" / unconfigured (also covers 0.0.0.0)
- *   - 169.254.0.0/16  link-local, clients are not reachable there
- *   - 224.0.0.0/4     multicast
- *   - 240.0.0.0/16    reserved, includes 255.255.255.255
- * Dropping these is nearly free and defeats the laziest spoofing tools.
- */
-static __always_inline __u8 ipv4_is_reserved_src(const __u32 host_src)
-{
-    const __u8 top = (__u8)(host_src >> 24);
-    if (top == 0 || top >= 224)
-    {
-        return 1;
-    }
-    if (top == 169 && (__u8)(host_src >> 16) == 254)
-    {
-        return 1;
-    }
-    return 0;
-}
-
-/*
- * Sources that are only reachable from inside the operator's own network
- * (host byte order): loopback, RFC1918, and CGNAT (100.64/10). Off by
- * default because a same-host proxy or a LAN monitoring host legitimately
- * connects from these ranges; turn it on when the protected service is
- * public-only. Never spoofed by an internet attacker, so the value here is
- * limiting self-inflicted noise and sloppy proxy configurations.
- */
-static __always_inline __u8 ipv4_is_private_src(const __u32 host_src)
-{
-    const __u8 top = (__u8)(host_src >> 24);
-    const __u8 second = (__u8)(host_src >> 16);
-    if (top == 10 || top == 127)
-    {
-        return 1;
-    }
-    if (top == 192 && second == 168)
-    {
-        return 1;
-    }
-    if (top == 172 && second >= 16 && second <= 31)
-    {
-        return 1;
-    }
-    if (top == 100 && second >= 64 && second <= 127)
-    {
-        return 1;
-    }
-    return 0;
-}
+// key identifying one TCP flow, the address and flow helpers and the
+// per-connection state now live in flow.h / maps.h (both address families).
 
 /*
  * Flag combinations that never occur on legitimate client traffic. Matches
@@ -253,6 +176,9 @@ static __always_inline __u8 ipv4_is_private_src(const __u32 host_src)
  * nothing from the connection state. A client never sends SYN+ACK (that is
  * the server's reply), never mixes SYN with FIN/RST, and never uses URG.
  * Packets without any of SYN/ACK/FIN/RST (NULL scan) are always forged.
+ *
+ * Kept here (and not in the bpf-only headers) so the native unit tests can
+ * exercise it directly.
  */
 static __always_inline __u8 tcp_flags_are_plausible(const struct tcphdr *tcp)
 {

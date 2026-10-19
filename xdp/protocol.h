@@ -62,6 +62,42 @@
 #define LOGIN_DATA_MAX (LOGIN_NAME_LEN_MAX + LOGIN_NAME_DATA_MAX + LOGIN_PUBLIC_KEY_MAX + LOGIN_HAS_UUID_LEN + UUID_LEN)
 
 /*
+ * Returns 1 if the payload starts with a PROXY protocol header: the v1
+ * text prefix "PROXY " or the v2 binary signature
+ * 0d 0a 0d 0a 00 0d 0a 51 55 49 54 0a.
+ *
+ * PROXY protocol is a proxy -> backend protocol: a real proxy in front of
+ * the filter is allowlisted and never reaches this check (allowlisted
+ * traffic returns before any inspection), so a header from anywhere else
+ * can only be a client trying to make a trusting backend believe it comes
+ * from another address - or a scanner fuzzing the listener. Neither is a
+ * legitimate client, and no valid minecraft frame can start with these
+ * bytes ('P' is a frame length of 80 whose packet id byte is 'R', never a
+ * valid id), so rejecting them costs nothing on the legitimate path.
+ */
+static __always_inline __u8 looks_like_proxy_header(const __u8 *cursor, const __u8 *payload_end, const void *data_end)
+{
+    if (!pkt_within(cursor, 6, data_end) || !pkt_within(cursor, 6, payload_end))
+    {
+        return 0;
+    }
+    if (cursor[0] == 'P' && cursor[1] == 'R' && cursor[2] == 'O' &&
+        cursor[3] == 'X' && cursor[4] == 'Y' && cursor[5] == ' ')
+    {
+        return 1;
+    }
+
+    if (cursor[0] != 0x0d || !pkt_within(cursor, 12, data_end) || !pkt_within(cursor, 12, payload_end))
+    {
+        return 0;
+    }
+    return cursor[1] == 0x0a && cursor[2] == 0x0d && cursor[3] == 0x0a &&
+           cursor[4] == 0x00 && cursor[5] == 0x0d && cursor[6] == 0x0a &&
+           cursor[7] == 0x51 && cursor[8] == 0x55 && cursor[9] == 0x49 &&
+           cursor[10] == 0x54 && cursor[11] == 0x0a;
+}
+
+/*
  * Validates the handshake packet and returns the resulting connection state,
  * or 0 if the packet is invalid. A client may append the status request or
  * login packet to the same TCP segment (also seen after retransmissions); in

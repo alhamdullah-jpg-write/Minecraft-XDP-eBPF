@@ -1,9 +1,17 @@
+mod advisor;
 mod allowlist;
+mod autotune;
+mod blocklist;
+mod cidr;
 mod config;
 mod ebpf;
 mod logging;
 mod metrics;
+mod ml;
+mod rules;
 mod shutdown;
+mod state;
+mod tunables;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -124,32 +132,65 @@ fn main() {
     }
 }
 
-/// Attaches the XDP filter and keeps it alive until shutdown is triggered.
-/// Dropping the `Ebpf` handle on return detaches the filter again.
+/// Attaches the XDP filter and its companion programs, starts every userspace
+/// worker and keeps the filter alive until shutdown is triggered. Dropping
+/// the `Ebpf` handle on return detaches everything again.
 fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
     let interface = args
         .interface
         .as_deref()
         .context("interface is required unless --license is specified")?;
 
-    // Parse the allowlist before attaching anything: a misconfigured file
-    // must stop the loader, not leave a half-configured filter running.
+    // Parse the lists before attaching anything: a misconfigured file must
+    // stop the loader, not leave a half-configured filter running.
     let allowlist = match &config.xdp.allowlist_file {
         Some(path) => Some(allowlist::Allowlist::load(Path::new(path))?),
         None => None,
     };
+    let blocklist = match &config.blocklist.blocklist_file {
+        Some(path) => Some(blocklist::Blocklist::load(Path::new(path))?),
+        None => None,
+    };
 
     // keep the handle alive until the end of this function: dropping it
-    // detaches the XDP program
-    let mut ebpf = ebpf::load_and_attach(interface, config)?;
-    let allowlist_thread = allowlist::start(&mut ebpf, config, allowlist, shutdown)?;
-    let stats_thread = metrics::start(&mut ebpf, config, shutdown)?;
+    // detaches the XDP and tc programs
+    let attached = ebpf::load_and_attach(interface, config)
+        .with_context(|| format!("failed to attach to interface '{interface}'"))?;
+    let ebpf::Attached {
+        ebpf: mut program,
+        tunables,
+        mode,
+    } = attached;
+    advisor::startup(interface, mode, config);
+
+    log_features(config, tunables.current());
+    let stats = metrics::take_stats(&mut program)?;
+    let allowlist_thread = allowlist::start(&mut program, config, allowlist, shutdown)?;
+    rules::start(&mut program, config)?;
+    let blocklist_runtime = blocklist::start(&mut program, config, blocklist, shutdown)?;
+    let autoblocks = blocklist_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.autoblocks.clone());
+    let stats_thread = metrics::start(stats.clone(), config, shutdown)?;
+    let autotune_thread = match stats.clone() {
+        Some(stats) => autotune::start(tunables, stats, config, shutdown)?,
+        None => None,
+    };
+    let ml_thread = ml::start(&mut program, config, autoblocks, shutdown)?;
+    let advisor_thread = advisor::start(stats, config, shutdown)?;
 
     shutdown.wait();
 
     for (thread, handle) in [
         ("allowlist", allowlist_thread),
+        (
+            "blocklist",
+            blocklist_runtime.and_then(|runtime| runtime.handle),
+        ),
         ("track-stats", stats_thread),
+        ("autotune", autotune_thread),
+        ("ml-score", ml_thread),
+        ("advisor", advisor_thread),
     ] {
         if let Some(handle) = handle {
             handle
@@ -158,4 +199,33 @@ fn run(args: &Args, config: &Config, shutdown: &Arc<Shutdown>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One line that says exactly which features are live; a surprising drop
+/// report is much easier to read with it in the log.
+fn log_features(config: &Config, tunables: tunables::Tunables) {
+    use config::MlMode;
+    info!(
+        "Features: host/subnet/global limits={}/{}/{}, udp limit={}, window={}ms, \
+         blocklist={}, autoblock={} (strikes={}), egress tracking={}, default-deny={}, \
+         rules={}, bedrock={}, voice={}, icmp={}, talkers={}, ml={:?}, autotune={}, advisor={}",
+        tunables.host_limit,
+        tunables.subnet_limit,
+        tunables.global_limit,
+        tunables.udp_limit,
+        tunables.window_ms,
+        config.blocklist.blocklist_file.is_some(),
+        config.blocklist.autoblock,
+        tunables.strike_threshold,
+        config.ingress.egress_tracking,
+        config.ingress.default_deny,
+        config.rules.len() + config.ingress.open_tcp_ports.len() + config.ingress.open_udp_ports.len(),
+        config.bedrock.enabled,
+        config.voice.enabled,
+        config.ingress.icmp,
+        config.ml.enabled || config.metrics.enabled || config.advisor.enabled,
+        if config.ml.enabled { config.ml.mode } else { MlMode::Off },
+        config.autotune.enabled,
+        config.advisor.enabled,
+    );
 }
