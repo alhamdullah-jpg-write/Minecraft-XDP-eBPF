@@ -30,6 +30,16 @@ jobs:
       run: rustup target add x86_64-unknown-linux-musl
     - name: Run tests
       run: cargo test --verbose
+    - name: End-to-end test (netns, every feature enabled)
+      # The only gate that loads the object with the feature switches turned on
+      # (the default-value verifier check below never exercises those verifier
+      # paths) and drives real traffic through it on a veth pair. Needs root
+      # for BPF, XDP, tc and netns; runs the debug build.
+      env:
+        XDP_LOADER_BIN: ${{ github.workspace }}/target/debug/xdp-loader
+      run: |
+        cargo build
+        sudo --preserve-env=XDP_LOADER_BIN ./tests/e2e_loader.sh
     - name: Verifier check (loads the object into the running kernel)
       # exit 3 means the CI environment cannot load XDP programs (not root,
       # no XDP support); any other failure is a real verifier/compile failure

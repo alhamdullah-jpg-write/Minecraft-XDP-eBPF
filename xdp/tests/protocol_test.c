@@ -17,6 +17,20 @@
 #define __always_inline inline __attribute__((always_inline))
 #endif
 
+// provided by bpf/bpf_endian.h in the BPF build
+#ifndef bpf_ntohl
+#define bpf_ntohl(value) __builtin_bswap32(value)
+#endif
+#ifndef bpf_ntohs
+#define bpf_ntohs(value) __builtin_bswap16(value)
+#endif
+#ifndef bpf_htons
+#define bpf_htons(value) __builtin_bswap16(value)
+#endif
+#ifndef bpf_htonl
+#define bpf_htonl(value) __builtin_bswap32(value)
+#endif
+
 /*
  * Stand-in for xdp/config.h, suppressed via its include guard: the real header
  * defines the knobs `volatile const`, but the login tests need to flip
@@ -28,6 +42,9 @@ static volatile __u8 ONLINE_NAMES = 1;
 #include "../common.h"
 #include "../varint.h"
 #include "../protocol.h"
+#include "../flow.h"
+#include "../limits.h"
+#include "../udp.h"
 
 /* ------------------------------------------------------------------------
  * Tiny test framework
@@ -864,6 +881,346 @@ static void test_skip_in_range_macro(void)
     free(heap);
 }
 
+/* ------------------------------------------------------------------------
+ * Flow keys, IPv6 classification and the pure limit helpers
+ * --------------------------------------------------------------------- */
+
+static void test_flow_key_layout(void)
+{
+    struct host_key src, dst;
+    host_key_from_v4(&src, bpf_htonl(0x0A000001u)); // 10.0.0.1
+    host_key_from_v4(&dst, bpf_htonl(0x0A000002u)); // 10.0.0.2
+    CHECK(src.family == HOST_FAM_V4);
+    CHECK(src.pad[0] == 0 && src.pad[1] == 0 && src.pad[2] == 0);
+    CHECK(src.addr[10] == 0xff && src.addr[11] == 0xff);
+    CHECK(src.addr[12] == 10 && src.addr[13] == 0 && src.addr[14] == 0 && src.addr[15] == 1);
+    CHECK(v4_from_mapped(src.addr) == bpf_htonl(0x0A000001u));
+
+    struct flow_key flow;
+    flow_key_from_hosts(&flow, &src, &dst, bpf_htons(1234), bpf_htons(25565), 6);
+    CHECK(flow.family == HOST_FAM_V4 && flow.proto == 6);
+    CHECK(flow.sport == bpf_htons(1234) && flow.dport == bpf_htons(25565));
+    CHECK(memcmp(flow.saddr, src.addr, 16) == 0);
+    CHECK(memcmp(flow.daddr, dst.addr, 16) == 0);
+
+    struct flow_key reverse;
+    flow_key_reverse(&flow, &reverse);
+    CHECK(memcmp(reverse.saddr, flow.daddr, 16) == 0);
+    CHECK(memcmp(reverse.daddr, flow.saddr, 16) == 0);
+    CHECK(reverse.sport == flow.dport && reverse.dport == flow.sport);
+    CHECK(reverse.family == flow.family && reverse.proto == flow.proto);
+
+    // reversing twice is the identity
+    struct flow_key back;
+    flow_key_reverse(&reverse, &back);
+    CHECK(memcmp(&back, &flow, sizeof(flow)) == 0);
+
+    // the family byte keeps a v4-mapped v6 packet from colliding with v4
+    __u8 mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1};
+    struct host_key as_v6;
+    host_key_from_v6(&as_v6, mapped);
+    CHECK(as_v6.family == HOST_FAM_V6);
+    CHECK(memcmp(as_v6.addr, src.addr, 16) == 0);
+    CHECK(memcmp(&as_v6, &src, sizeof(src)) != 0); // only the family byte differs
+
+    // LPM key: exact match with prefixlen 128 for both families
+    struct lpm_key lpm;
+    lpm_key_from_host(&src, &lpm);
+    CHECK(lpm.prefixlen == 128);
+    CHECK(memcmp(lpm.addr, src.addr, 16) == 0);
+}
+
+static void test_ipv6_source_classification(void)
+{
+    __u8 unspecified[16] = {0};
+    CHECK(ipv6_is_reserved_src(unspecified) == 1); // ::
+
+    __u8 loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    CHECK(ipv6_is_reserved_src(loopback) == 1); // ::1
+
+    __u8 multicast[16] = {0xff, 0x02};
+    CHECK(ipv6_is_reserved_src(multicast) == 1); // ff02::/16 is inside ff00::/8
+
+    __u8 link_local[16] = {0xfe, 0x80};
+    link_local[15] = 1;
+    CHECK(ipv6_is_reserved_src(link_local) == 1); // fe80::1
+
+    __u8 site_local[16] = {0xfe, 0xc0};
+    CHECK(ipv6_is_reserved_src(site_local) == 0); // fec0::/10 is not in the set
+
+    __u8 mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4};
+    CHECK(ipv6_is_reserved_src(mapped) == 1); // ::ffff:1.2.3.4 on the wire
+
+    __u8 global[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    CHECK(ipv6_is_reserved_src(global) == 0); // 2001:db8::1
+    CHECK(ipv6_is_private_src(global) == 0);
+
+    __u8 ula[16] = {0xfd, 0x12};
+    CHECK(ipv6_is_private_src(ula) == 1);  // fc00::/7
+    CHECK(ipv6_is_reserved_src(ula) == 0);
+
+    // the family dispatch routes each family to its own check
+    struct host_key key;
+    host_key_from_v4(&key, bpf_htonl(0x7F000001u)); // 127.0.0.1
+    CHECK(source_is_reserved(key.family, key.addr) == 0);
+    CHECK(source_is_private(key.family, key.addr) == 1);
+    host_key_from_v6(&key, loopback);
+    CHECK(source_is_reserved(key.family, key.addr) == 1);
+    host_key_from_v6(&key, global);
+    CHECK(source_is_reserved(key.family, key.addr) == 0);
+}
+
+static void test_subnet_masking(void)
+{
+    struct host_key host, subnet;
+    host_key_from_v4(&host, bpf_htonl(0xC0A80A63u)); // 192.168.10.99
+    subnet_key_from_host(&host, &subnet);
+    CHECK(subnet.family == HOST_FAM_V4);
+    CHECK(subnet.addr[12] == 192 && subnet.addr[13] == 168 && subnet.addr[14] == 10);
+    CHECK(subnet.addr[15] == 0);
+
+    // two addresses in one /24 share a bucket, the next /24 does not
+    struct host_key other, other_subnet;
+    host_key_from_v4(&other, bpf_htonl(0xC0A80A01u)); // 192.168.10.1
+    subnet_key_from_host(&other, &other_subnet);
+    CHECK(memcmp(&subnet, &other_subnet, sizeof(subnet)) == 0);
+    host_key_from_v4(&other, bpf_htonl(0xC0A80B01u)); // 192.168.11.1
+    subnet_key_from_host(&other, &other_subnet);
+    CHECK(memcmp(&subnet, &other_subnet, sizeof(subnet)) != 0);
+
+    // v6: the /64 keeps the first 8 bytes, zeroes the interface id
+    __u8 addr[16] = {0x20, 0x01, 0x0d, 0xb8, 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8};
+    host_key_from_v6(&host, addr);
+    subnet_key_from_host(&host, &subnet);
+    CHECK(subnet.family == HOST_FAM_V6);
+    CHECK(memcmp(subnet.addr, addr, 8) == 0);
+    for (int i = 8; i < 16; i++)
+    {
+        CHECK(subnet.addr[i] == 0);
+    }
+}
+
+static void test_rate_sliding_estimate(void)
+{
+    const __u64 window = 1000000000ull;
+    // half the window elapsed: half of the previous window still counts
+    CHECK(rate_sliding_estimate(10, 20, window / 2, window) == 20);
+    // start of the window: the full previous window counts
+    CHECK(rate_sliding_estimate(10, 20, 0, window) == 30);
+    // quarter elapsed: three quarters of the previous window
+    CHECK(rate_sliding_estimate(0, 1000, window / 4, window) == 750);
+    // a full window (or more) elapsed: only the current window remains
+    CHECK(rate_sliding_estimate(10, 20, window, window) == 10);
+    CHECK(rate_sliding_estimate(10, 20, window * 2, window) == 10);
+    // no window configured (never written by the loader) means no extrapolation
+    CHECK(rate_sliding_estimate(7, 999, 0, 0) == 7);
+}
+
+static void test_egress_seq_in_window(void)
+{
+    // the remote side acks what we sent: ack in [base-1, next+1]
+    CHECK(egress_seq_in_window(100, 100, 99) == 1);  // ack = base-1: the syn-ack
+    CHECK(egress_seq_in_window(100, 100, 100) == 1); // ack = base
+    CHECK(egress_seq_in_window(100, 150, 151) == 1); // ack = next+1: all data acked
+    CHECK(egress_seq_in_window(100, 100, 98) == 0);  // before the window: blind
+    CHECK(egress_seq_in_window(100, 150, 152) == 0); // beyond what we sent: blind
+    // an unsolicited segment cannot guess an ack in the middle of the window
+    CHECK(egress_seq_in_window(0, 4096, 2048) == 1);
+    // near the top of the sequence space the comparisons still hold
+    CHECK(egress_seq_in_window(0xFFFFFFFFFFFFFF00ull, 0xFFFFFFFFFFFFFF00ull + 16,
+                               0xFFFFFFFFFFFFFF00ull + 8) == 1);
+}
+
+static void test_flow_flood_ok(void)
+{
+    const __u64 window = 1000000000ull;
+    __u64 start = 0, packets = 0, bytes = 0;
+
+    // both limits off: never touches the counters
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 500, 100, 0, 0, window) == 1);
+    CHECK(start == 0 && packets == 0 && bytes == 0);
+
+    // pps cap of 3: the 4th packet in the window is over the cap
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1000, 60, 3, 0, window) == 1);
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1100, 60, 3, 0, window) == 1);
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1200, 60, 3, 0, window) == 1);
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1300, 60, 3, 0, window) == 0);
+    // ... but a new window recovers without any state being killed
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1000 + window, 60, 3, 0, window) == 1);
+    CHECK(packets == 1);
+
+    // byte cap of 200: counted independently of the packet cap
+    start = 0;
+    packets = 0;
+    bytes = 0;
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1000, 150, 0, 200, window) == 1);
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1100, 150, 0, 200, window) == 0);
+    // exactly at the cap passes, one byte over does not
+    CHECK(bytes == 300);
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1000 + window, 200, 0, 200, window) == 1);
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1000 + window + 1, 1, 0, 200, window) == 0);
+
+    // a stale window (clock going backwards is impossible, but a start in the
+    // future must not wedge the entry) restarts instead of wrapping
+    start = 5000;
+    packets = 9;
+    bytes = 9;
+    CHECK(flow_flood_ok(&start, &packets, &bytes, 1000, 10, 1, 0, window) == 1);
+    CHECK(start == 1000 && packets == 1 && bytes == 10);
+}
+
+static void test_proxy_header_detection(void)
+{
+    __u8 v1[16] = {'P', 'R', 'O', 'X', 'Y', ' ', 'T', 'C', 'P', '4'};
+    CHECK(looks_like_proxy_header(v1, v1 + sizeof(v1), v1 + sizeof(v1)) == 1);
+    // exactly the 6 byte prefix already classifies (payload ends there)
+    __u8 prefix[6] = {'P', 'R', 'O', 'X', 'Y', ' '};
+    CHECK(looks_like_proxy_header(prefix, prefix + 6, prefix + 6) == 1);
+    // a truncated prefix can not be classified without reading past payload_end
+    CHECK(looks_like_proxy_header(prefix, prefix + 5, prefix + 6) == 0);
+
+    // PROXY v2 binary signature
+    const __u8 v2[12] = {0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d,
+                         0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a};
+    CHECK(looks_like_proxy_header(v2, v2 + 12, v2 + 12) == 1);
+    CHECK(looks_like_proxy_header(v2, v2 + 11, v2 + 12) == 0); // needs all 12
+    __u8 bad[12];
+    memcpy(bad, v2, sizeof(bad));
+    bad[4] = 0x0b;
+    CHECK(looks_like_proxy_header(bad, bad + 12, bad + 12) == 0);
+
+    // ordinary minecraft payloads never match: a handshake, a legacy ping
+    // and a lone 'P' (which is the frame length 80, not a prefix)
+    __u8 handshake[8] = {0x10, 0x00, 0x02, 0x2f, 0x02, 'l', 'o', 'c'};
+    CHECK(looks_like_proxy_header(handshake, handshake + sizeof(handshake), handshake + sizeof(handshake)) == 0);
+    __u8 legacy[2] = {0xfe, 0x01};
+    CHECK(looks_like_proxy_header(legacy, legacy + 2, legacy + 2) == 0);
+    __u8 lone_p[6] = {'P', 0x00, 0x00, 0x00, 0x00, 0x00};
+    CHECK(looks_like_proxy_header(lone_p, lone_p + 6, lone_p + 6) == 0);
+}
+
+static void put_raknet_magic(__u8 *at)
+{
+    const __u8 magic[16] = {0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe,
+                            0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78};
+    memcpy(at, magic, 16);
+}
+
+static void test_raknet_offline_validation(void)
+{
+    // 0x01 unconnected ping: exactly 33 bytes
+    __u8 ping[33] = {0x01};
+    put_raknet_magic(&ping[9]);
+    CHECK(raknet_is_valid_offline(ping, sizeof(ping), ping + sizeof(ping), 1400, 1500, 0, 0, 255) == 1);
+    CHECK(raknet_is_valid_offline(ping, sizeof(ping) - 1, ping + sizeof(ping), 1400, 1500, 0, 0, 255) == 0);
+    __u8 ping_long[34] = {0x01};
+    put_raknet_magic(&ping_long[9]);
+    CHECK(raknet_is_valid_offline(ping_long, sizeof(ping_long), ping_long + sizeof(ping_long), 1400, 1500, 0, 0, 255) == 0);
+    ping[12] ^= 0xff; // corrupted magic
+    CHECK(raknet_is_valid_offline(ping, sizeof(ping), ping + sizeof(ping), 1400, 1500, 0, 0, 255) == 0);
+    put_raknet_magic(&ping[9]);
+
+    // 0x02 (open ping, some forks append the mtu): 33 bytes and up
+    __u8 open_ping[35] = {0x02};
+    put_raknet_magic(&open_ping[9]);
+    CHECK(raknet_is_valid_offline(open_ping, 33, open_ping + 35, 1400, 1500, 0, 0, 255) == 1);
+    CHECK(raknet_is_valid_offline(open_ping, 35, open_ping + 35, 1400, 1500, 0, 0, 255) == 1);
+    CHECK(raknet_is_valid_offline(open_ping, 32, open_ping + 32, 1400, 1500, 0, 0, 255) == 0);
+
+    // 0x05 open connection request 1: magic at offset 1, mtu in the last two bytes
+    __u8 ocr1[20] = {0x05};
+    put_raknet_magic(&ocr1[1]);
+    ocr1[17] = 0x00; // protocol version byte
+    ocr1[18] = 0x05; // mtu 1400, big endian
+    ocr1[19] = 0x78;
+    CHECK(raknet_is_valid_offline(ocr1, sizeof(ocr1), ocr1 + sizeof(ocr1), 1400, 1500, 0, 0, 255) == 1);
+    ocr1[18] = 0x00; // mtu 1: below the window
+    ocr1[19] = 0x01;
+    CHECK(raknet_is_valid_offline(ocr1, sizeof(ocr1), ocr1 + sizeof(ocr1), 1400, 1500, 0, 0, 255) == 0);
+    ocr1[18] = 0x0f; // mtu 4095: above the window
+    ocr1[19] = 0xff;
+    CHECK(raknet_is_valid_offline(ocr1, sizeof(ocr1), ocr1 + sizeof(ocr1), 1400, 1500, 0, 0, 255) == 0);
+    ocr1[18] = 0x05;
+    ocr1[19] = 0x78;
+    ocr1[17] = 100; // protocol version byte outside the strict window
+    CHECK(raknet_is_valid_offline(ocr1, sizeof(ocr1), ocr1 + sizeof(ocr1), 1400, 1500, 1, 10, 12) == 0);
+    ocr1[17] = 11; // the historical raknet protocol version
+    CHECK(raknet_is_valid_offline(ocr1, sizeof(ocr1), ocr1 + sizeof(ocr1), 1400, 1500, 1, 10, 12) == 1);
+    ocr1[17] = 3; // permissive mode ignores the version byte
+    CHECK(raknet_is_valid_offline(ocr1, sizeof(ocr1), ocr1 + sizeof(ocr1), 1400, 1500, 0, 10, 12) == 1);
+    // a truncated packet is rejected even when the declared length fits
+    CHECK(raknet_is_valid_offline(ocr1, sizeof(ocr1) - 1, ocr1 + sizeof(ocr1) - 1, 1400, 1500, 0, 0, 255) == 0);
+    // oversize datagrams are rejected before any field is trusted
+    static __u8 big[RAKNET_MAX_DATAGRAM + 1];
+    memset(big, 0, sizeof(big));
+    big[0] = 0x05;
+    put_raknet_magic(&big[1]);
+    CHECK(raknet_is_valid_offline(big, sizeof(big), big + sizeof(big), 1400, 1500, 0, 0, 255) == 0);
+
+    // 0x07 open connection request 2: magic at offset 1, at least 21 bytes
+    __u8 ocr2[21] = {0x07};
+    put_raknet_magic(&ocr2[1]);
+    CHECK(raknet_is_valid_offline(ocr2, sizeof(ocr2), ocr2 + sizeof(ocr2), 1400, 1500, 0, 0, 255) == 1);
+    CHECK(raknet_is_valid_offline(ocr2, 20, ocr2 + sizeof(ocr2), 1400, 1500, 0, 0, 255) == 0);
+
+    // connected traffic and empty payloads are not offline handshakes
+    __u8 connected = 0xfe;
+    CHECK(raknet_is_valid_offline(&connected, 1, &connected + 1, 1400, 1500, 0, 0, 255) == 0);
+    CHECK(raknet_is_valid_offline(ping, 0, ping, 1400, 1500, 0, 0, 255) == 0);
+}
+
+static void test_raknet_offline_ids(void)
+{
+    // the four ids the offline validator understands are recognized as such
+    // (that is what turns a malformed body into a provable reject: no
+    // legitimate connected datagram starts with one of these ids)
+    __u8 ping[33] = {0x01};
+    CHECK(raknet_looks_like_offline_handshake(ping, sizeof(ping), ping + sizeof(ping)) == 1);
+    __u8 open_ping[35] = {0x02};
+    CHECK(raknet_looks_like_offline_handshake(open_ping, 33, open_ping + sizeof(open_ping)) == 1);
+    __u8 ocr1[20] = {0x05};
+    CHECK(raknet_looks_like_offline_handshake(ocr1, sizeof(ocr1), ocr1 + sizeof(ocr1)) == 1);
+    __u8 ocr2[21] = {0x07};
+    CHECK(raknet_looks_like_offline_handshake(ocr2, sizeof(ocr2), ocr2 + sizeof(ocr2)) == 1);
+
+    // connected game traffic (0x80 valid bit) and raknet's own internal
+    // datagram ids are not connection attempts
+    __u8 game[4] = {0x84, 0x01, 0x02, 0x03};
+    CHECK(raknet_looks_like_offline_handshake(game, sizeof(game), game + sizeof(game)) == 0);
+    __u8 ack = 0xa0;
+    CHECK(raknet_looks_like_offline_handshake(&ack, 1, &ack + 1) == 0);
+    __u8 connection_request = 0x09;
+    CHECK(raknet_looks_like_offline_handshake(&connection_request, 1, &connection_request + 1) == 0);
+    __u8 garbage[10] = {'B', 'E', 'D', 'G', 'A', 'R', 'B', 'A', 'G', 'E'};
+    CHECK(raknet_looks_like_offline_handshake(garbage, sizeof(garbage), garbage + sizeof(garbage)) == 0);
+
+    // empty payloads (and a payload whose first byte is not in the frame)
+    CHECK(raknet_looks_like_offline_handshake(garbage, 0, garbage) == 0);
+
+    // and the combination the filter uses: a well-formed offline ping is
+    // valid, the same packet with a corrupted magic is a handshake that
+    // must be rejected statelessly
+    put_raknet_magic(&ping[9]);
+    CHECK(raknet_is_valid_offline(ping, sizeof(ping), ping + sizeof(ping), 1400, 1500, 0, 0, 255) == 1);
+    ping[9] ^= 0xff;
+    CHECK(raknet_looks_like_offline_handshake(ping, sizeof(ping), ping + sizeof(ping)) == 1);
+    CHECK(raknet_is_valid_offline(ping, sizeof(ping), ping + sizeof(ping), 1400, 1500, 0, 0, 255) == 0);
+}
+
+static void test_voice_shape_check(void)
+{
+    __u8 packet[8] = {0x05, 1, 2, 3, 4, 5, 6, 7};
+    CHECK(voice_is_valid_shape(packet, sizeof(packet), packet + sizeof(packet), 0x10) == 1);
+    packet[0] = 0x11; // outside the configured type range
+    CHECK(voice_is_valid_shape(packet, sizeof(packet), packet + sizeof(packet), 0x10) == 0);
+    packet[0] = 0x00;
+    CHECK(voice_is_valid_shape(packet, 0, packet + sizeof(packet), 0x10) == 0);
+    static __u8 big[1401];
+    memset(big, 1, sizeof(big));
+    CHECK(voice_is_valid_shape(big, sizeof(big), big + sizeof(big), 0xff) == 0);
+    CHECK(voice_is_valid_shape(big, 1400, big + 1400, 0xff) == 1);
+}
+
 /* --------------------------------------------------------------------- */
 
 int main(void)
@@ -892,6 +1249,16 @@ int main(void)
     test_ipv4_source_classification();
     test_tcp_flags_plausible();
     test_skip_in_range_macro();
+    test_flow_key_layout();
+    test_ipv6_source_classification();
+    test_subnet_masking();
+    test_rate_sliding_estimate();
+    test_egress_seq_in_window();
+    test_flow_flood_ok();
+    test_proxy_header_detection();
+    test_raknet_offline_validation();
+    test_raknet_offline_ids();
+    test_voice_shape_check();
 
     printf("%u checks, %u failures\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;

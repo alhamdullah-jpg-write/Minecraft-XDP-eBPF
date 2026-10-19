@@ -14,6 +14,7 @@ target/
 *.log
 *.tmp
 *.swp
+__pycache__/
 
 # Generated at runtime on first launch
 config.toml
