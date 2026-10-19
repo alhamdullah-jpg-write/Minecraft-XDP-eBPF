@@ -4,95 +4,126 @@ Ordered by (a) risk closed per unit of work, (b) measurable effect on the
 numbers in `docs/benchmark-test-plan.md`. Each phase is independently
 deployable and testable with the S-cases.
 
-## Phase 1 — done (this revision)
+The list below is the actual state of the tree, not an aspiration: completed
+items name the file or test that proves them, and every remaining item is
+still open. Nothing is called "done" without either a unit test or a stage in
+`tests/e2e_loader.sh`.
 
-- IPv4 TCP L3/L4 stateless sanity checks (IP/TCP header validation, strict
-  `tot_len` check, impossible TCP flag combinations).
+## Delivered
+
+### Phase 1 — stateless filtering and the verified fast path
+
+- IPv4 TCP L3/L4 sanity checks (IP/TCP header validation, strict `tot_len`,
+  impossible flag combinations).
 - Spoof filtering: reserved sources (default on), private sources (opt-in).
 - Bounded connection tracking with in-kernel expiry (`conntrack_map`,
-  `player_connection_map`, `connection_throttle` + `bpf_timer`).
-- Minecraft protocol inspection with varint/bounds-hardened parser.
+  `player_connection_map`, `host_throttle` + `bpf_timer`).
+- Minecraft protocol inspection with a VarInt/bounds-hardened parser
+  (`xdp/protocol.h`, `xdp/varint.h`).
 - Allowlist LPM trie with SIGHUP reload, dry-run mode, per-reason drop
   counters, Prometheus endpoint.
-- Verifier load-test script + native C parser unit tests + Rust unit tests.
 
-## Phase 2 — close the protocol gaps (highest user-visible value)
+### Phase 2 — protocol and scale gaps
 
-1. **IPv6 inspection** (TCP). The stateless checks and the state machine are
-   address-family agnostic; the work is parsers and map key changes:
-   - new `ipv6_flow_key` (`struct in6_addr` × 2, ports) + separate maps, or a
-     tagged common key (branch per family to keep the fast path cheap);
-   - extend the allowlist trie to IPv6 (two tries or a 16-byte key);
-   - keep IPv6 accounting so operators can prove coverage.
-   Effort: medium. Test: S9 IPv6 rows move from "documented gap" to covered.
-2. **UDP: Bedrock / RakNet (`19132/udp`)**. Stateless RakNet validation is
-   cheap and highly effective against the common reflection and junk floods:
-   verify the RakNet magic (`...00ffff00fefefefefdfdfdfd12345678`), the
-   datagram type (Unconnected Ping `0x01`/`0x02`, Open Connection Request
-   1/2 `0x05`/`0x07`, online `0x08`), MTU bounds, protocol version, and reply
-   statelessly for the ping (the standard RakNet offline-message defense);
-   track `Open Connection Reply 1/2` + cookie (`0x09` cookie handshake in
-   recent versions) per source IP with the existing throttle pattern.
-   Effort: medium. Test: S3/S4 equivalents for RakNet.
-3. **Simple Voice Chat (`24454/udp`, plugin-configurable)**. Validate the
-   plugin's packet shape (magic bytes/type/secret), bind it to the same
-   verified-IP map from the Java connection where possible, and allow per-IP
-   rate limits. Effort: low-medium (protocol is documented and small).
-4. **Custom rule engine** (YAML/TOML): compile declarative rules
-   (`protocol`, ports, `len min/max`, magic at offset, rate, action) into BPF
-   maps that a *generic* matcher in the program consults; hot reload like the
-   allowlist. This replaces "write a C patch per protocol" for operators.
-   Effort: high, but the only way to cover the long tail (mods, other
-   services) without unbounded C growth. Must stay verifier-friendly
-   (bounded loops over map entries).
-5. **Per-subnet (e.g. /24) and global token buckets**: a spoofed flood with
-   millions of addresses defeats per-IP limits; add a second-level bucket per
-   /24 and one global "new connections/s" allowance so the filter degrades
-   gracefully instead of exhausting maps. Also upgrade the per-IP window to a
-   sliding/token-bucket window to remove the 2× boundary burst.
+- **IPv6 inspection** — one 16-byte address representation and a tagged flow
+  key (`xdp/flow.h`), so the state machine covers IPv4 and IPv6 without a
+  second code path; IPv6 accounting kept (`minecraft_ipv6_packets`).
+- **Bedrock/RakNet (`19132/udp`, opt-in)** — stateless offline-handshake
+  validation with a strict protocol/MTU window (`xdp/udp.h`), a provable
+  rejection for malformed handshakes (`bedrock_invalid`), and the stateful
+  pinhole for connected game traffic (`bedrock_untracked`).
+- **Simple Voice Chat (`24454/udp`, opt-in)** — shape check plus the
+  verified-IP gate fed by the Java login (`voice_unverified`, `voice_invalid`).
+- **Custom rule engine** — `[[rules]]` matches protocol/ports, length bounds,
+  magic at an offset and an allow/drop/rate action, compiled into `rule_map`
+  at load time (`xdp/rules.h`, loader validation rejects rules that target the
+  dedicated protocol ports).
+- **Per-subnet (/24, /64) and global token windows** — `subnet_throttle` and
+  `global_rate` bound what a spoofed flood can buy; the per-source window is
+  extrapolated with a sliding estimate so a window boundary no longer doubles
+  the burst.
 
-## Phase 3 — operational depth
+### Phase 3 — operational depth
 
-1. **Top-talkers / sampled forensics**: a ring buffer with the first N packets
-   of dropped flows (headers only, sampled 1:1000) plus userspace decoding, so
-   operators can see *what* the attack looked like. Never on the hot path
-   unguarded (bounded ring, per-CPU).
-2. **Egress hook** (`tc` egress / XDP egress on capable NICs): drop reflections
-   from other local services, and observe the server's outbound SYN-ACKs to
-   correlate Y (verified) with reality; can also feed a "real unique player IPs"
-   list for smarter allowlisting.
-3. **Integration test harness**: netns + veth pair + crafted packet suites
-   asserting `minecraft_drop_reason` per case (the S3/S10 cases automated).
-   Run in CI where privileged, otherwise nightly.
-4. **Fuzzing**: libFuzzer/AFL on `xdp/tests/protocol_test.c`'s parsers with
-   ASan (already sanitized), seeded from real client captures per version.
-5. **Loader robustness**: pin the maps (`BPF_F_MMAPABLE`/pinned paths) so a
+- **Sampled top-talkers** — `talkers_map` (LRU, per-source packets/bytes/SYNs/
+  drops) feeds the metrics endpoint, the sizing advisor and the ML scorer.
+- **Egress hook** — a `tc egress` program (`xdp/egress.h`, same object) tracks
+  what the host itself sent, keyed by the reverse 5-tuple.
+- **Stateful pinhole + default-deny ingress** — the egress-tracked flows back a
+  TCP-sequence/ICMP-ident checked pinhole, and `[ingress] default_deny = true`
+  turns "not explicitly opened" into a drop (`unsolicited`, `proto_deny`).
+- **Integration test harness** — `tests/e2e_loader.sh` builds a veth pair in a
+  network namespace, loads the object with every feature enabled, drives real
+  traffic (`tests/e2e_traffic.py`: valid clients, the pinhole across a punch,
+  crafted attack shapes, flood/lockout stages) and asserts on both the traffic
+  that arrived and the reason counters; it runs in CI (`rust.yml`).
+- **Escalating auto-blocklist** — strikes on per-source limits, doubling TTLs,
+  decay, dry-run, an export file and its own counters (`xdp/blocklist.h`).
+- **Auto-tuner** — bounded, damped userspace control loop for the limits that
+  were explicitly configured, dry-run by default, state persisted to TOML
+  (`loader/autotune.rs`).
+- **ML risk scoring** — userspace logistic regression over talker features,
+  trained from this host's own labels, shadow mode by default
+  (`loader/ml.rs`).
+- **Documented drop-reason registry** — 345 stable values, 46 emitted by this
+  build, with generated tables and a `--check` mode
+  (`docs/drop-reasons.md`, `xdp/tests/gen_drop_reason_docs.py`).
+
+### Phase 4 (partial)
+
+- **XDP offload support** — `mode = "offload"` is wired through the loader
+  (attach mode plus a clear error when the driver does not support it); the
+  performance claims still need the S-cases on offloading hardware, so the
+  numbers in `docs/benchmark-test-plan.md` remain the acceptance gate.
+- **Cheap filters first** — the packet path checks allowlist, stateless
+  headers, the blocklists and the fail-closed map state before it touches the
+  parser or the rate tables (see the ordering in `xdp/minecraft_filter.c`).
+
+## Open
+
+### Next: correctness and confidence
+
+1. **Fuzzing** — libFuzzer/AFL on the parsers in `xdp/tests/protocol_test.c`
+   (already ASan/UBSan-clean), seeded from real client captures per version.
+2. **Loader robustness** — pin the maps (`BPF_F_MMAPABLE`/pinned paths) so a
    loader restart can reuse state; optional `--keep-attached` watchdog mode;
-   structured logs; OTLP/metrics-txt parity.
+   structured logs; OTLP parity.
+3. **Egress tracking for UDP replies (beyond the pinhole)** — today the
+   pinhole is what protects stateful UDP; a richer tracker would let the rule
+   engine express "reply-only" ports without either opening a port or
+   default-deny.
 
-## Phase 4 — performance headroom
+### Then: performance headroom
 
-1. **XDP hardware offload** where supported (`mode = "offload"`), for line-rate
-   filtering at 10/25/40 GbE without consuming host CPU.
-2. **XDP metadata (`xdp_hints`)** for fragmented/GRO cases where the driver
+4. **XDP metadata (`xdp_hints`)** for fragmented/GRO cases where the driver
    supports it; skip the header re-parse.
-3. **Map tuning**: `BPF_F_NO_PREALLOC` vs. prealloc trade-offs measured
-   (S7 knee), per-CPU LRU for conntrack to avoid global spinlocks.
-4. **Instruction budget**: keep the program < 1 k insns per path, verify with
-   `bpftool prog profile` per-core cost (S1/S7).
+5. **Map tuning measured, not assumed** — `BPF_F_NO_PREALLOC` vs. prealloc
+   trade-offs (S7 knee), per-CPU LRU structures where the global spinlock
+   shows up in `bpftool prog profile`.
+6. **Instruction budget** — keep each path under ~1 k insns and verify the
+   per-core cost with `bpftool prog profile` (S1/S7); publish the numbers next
+   to the claims.
+
+### Later
+
+7. **Version matrix automation** — the S9 rows (1.8 … 1.21.x, Forge/Fabric,
+   proxies, snapshots) as a scheduled job against a disposable server.
+8. **Geo/ASN-aware buckets** — only if the S-cases show per-subnet buckets are
+   not enough; needs an offline prefix table and stays opt-in.
 
 ## Explicitly not planned
 
 - Competing with anycast scrubbing on volumetric capacity — buy upstream
   scrubbing; this filter complements it.
-- Inspecting encrypted login traffic or "detecting bots" heuristically:
-  unreliable, high false-positive risk, and out of protocol.
+- Inspecting encrypted login traffic or "detecting bots" heuristically beyond
+  the documented shadow-mode scorer: unreliable, high false-positive risk, and
+  out of protocol.
 - Rewriting the whole thing in Rust/eBPF (aya) for a marginal safety gain at a
   large cost in verifier surprises.
 
 ## How to decide what's next
 
-Run `docs/benchmark-test-plan.md` S-cases against the current build; the phase
+Run `docs/benchmark-test-plan.md` S-cases against the current build; the item
 that removes the first failing acceptance criterion gets done first. In most
-deployments that is Phase 2.1 (IPv6) if the server publishes AAAA records, or
-Phase 2.2 (Bedrock) if the host runs Geyser.
+deployments that is now the fuzzing/loader-robustness pair (the protocol gaps
+that used to be listed here are closed).

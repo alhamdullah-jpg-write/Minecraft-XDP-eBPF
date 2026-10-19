@@ -1,31 +1,42 @@
 # Minecraft XDP Filter using eBPF – L7 DDoS Protection
 
-This project offers a high-performance XDP-based firewall utilizing eBPF, specifically designed for Minecraft Java Edition servers.  
+This project offers a high-performance XDP-based firewall utilizing eBPF, specifically designed for Minecraft servers
+(Java, Bedrock and the Simple Voice Chat plugin) and the UDP/TCP ports they use.  
 It effectively mitigates L7 DDoS attacks by filtering malicious packets at the kernel level (before they reach the network stack).  
-Currently, the filter is available for IPv4 and supports Minecraft versions 1.8 - 26.3    
-The default filtered port is 25565.
+It runs on IPv4 and IPv6, on native XDP, generic (`skb`) or offloaded XDP, and the parser validates *framing* rather than
+hardcoded protocol versions, so releases, snapshots and forks that keep the vanilla framing work unchanged.
+The default filtered port is 25565 (Java); Bedrock (`19132/udp`) and voice (`24454/udp`) are opt-in.
 
 💬 Questions, feedback or help needed? Join the Discord: https://discord.gg/JnBJPgV4GW
 
 Documentation: [threat model & scope](docs/threat-model.md) ·
 [deployment guide](docs/deployment.md) ·
+[drop reasons & counters](docs/drop-reasons.md) ·
 [benchmark & test plan](docs/benchmark-test-plan.md) ·
 [roadmap](docs/roadmap.md).
 
 ## Features
-- **Protocol Analysis**: Analyzes Minecraft handshakes, status, ping, and login requests.
-- **Deep Packet Inspection**: Drops invalid packets, bad VarInts, and protocol violations.
-- **Connection Throttle**: Integrated SYN rate limiting (default: 10 SYNs per 3 seconds per IP).
-- **Spoof/Sanity Filtering**: Drops reserved and (optionally) private source addresses, malformed headers, impossible TCP flag combinations and fragmented traffic aimed at the protected port.
-- **Verified Fast Path**: A connection that completes the inspected handshake is remembered in-kernel; its packets then skip the parser entirely. Per-entry `bpf_timer` cleanup means no userspace process touches the hot path.
-- **Allowlist**: Source addresses/CIDRs in an LPM trie bypass all checks; re-read on `SIGHUP` without detaching the program. See the spoofing caveat below.
-- **Dry Run**: `dry_run = true` counts and logs every would-be drop while letting all packets through, so rules can be tuned against live traffic first.
-- **Observability**: Opt-in per-CPU statistics with a Prometheus endpoint, one counter per drop reason (`minecraft_drop_reason{reason="..."}`) plus connection/traffic totals.
-- **Zero-Copy Dropping**: Malicious traffic is dropped at the driver level (XDP_DROP) for maximum performance.
+- **Minecraft protocol inspection**: parses handshakes, status, ping and login requests of the Java protocol
+  (framing, VarInts, bounds) plus the Bedrock/RakNet offline handshake and Simple Voice Chat packet shape.
+- **Stateful, not just stateless**: connections are tracked in-kernel, and the loader's `tc egress` hook records what the
+  host itself sent so inbound packets can be matched against real flows (stateful UDP pinhole, optional default-deny
+  ingress for every port that is not explicitly opened).
+- **Rate limiting with cheap filters first**: per-source, per-subnet (/24, /64) and global token windows, per-flow UDP
+  limits, a rule engine for arbitrary ports (magic/length/rate) and an opt-in abuse cap for the verified fast path.
+- **Verified fast path**: a connection that completes the inspected handshake is remembered in-kernel; its packets then
+  skip the parser entirely. Per-entry `bpf_timer` cleanup means no userspace process touches the hot path.
+- **Escalating auto-blocklist**: repeated per-source abuse raises strikes and blocks the source for a doubling TTL,
+  exported to a file; separate `autoblock` counters and a dry-run mode keep it auditable.
+- **Observability & operations**: Prometheus endpoint with one counter per drop reason
+  ([documented registry](docs/drop-reasons.md)), sampled top-talkers, a sizing/NIC advisor, an optional auto-tuner for
+  the limits (bounded, damped, persisted) and an optional userspace ML scorer (shadow by default).
+- **Zero-copy dropping**: malicious traffic is dropped at the driver level (XDP_DROP) for maximum performance,
+  with an allowlist that bypasses all checks and reloads on `SIGHUP`.
 
 What it does, what it cannot do and the residual risks are documented in
 [`docs/threat-model.md`](docs/threat-model.md); read that before relying on it
-against a real attack.
+against a real attack. Every control that can affect legitimate traffic has a
+dry-run or shadow mode; use it before arming things.
 
 ## Installation (Linux)
 
@@ -65,7 +76,10 @@ Then just run the executable in sudo mode or via root
     ```
     Besides the Rust unit tests this compiles the eBPF parsing code (VarInt
     reader, packet inspectors) natively with ASan/UBSan and runs its C unit
-    tests (see `xdp/tests/protocol_test.c`).
+    tests (see `xdp/tests/protocol_test.c`). The privileged end-to-end test
+    (`sudo ./tests/e2e_loader.sh`) additionally loads the real object with
+    every feature enabled and drives real traffic through it in a network
+    namespace.
 
 3.  **Run the firewall**:
     ```bash
@@ -96,49 +110,26 @@ Then just run the executable in sudo mode or via root
 ## Configuration
 
 Runtime behavior is controlled by a `config.toml` file next to the binary.
-On first run it is created automatically with documented defaults; edit it and
-restart the loader. Use `--config <path>` to point at a different file.
+On first run it is created automatically with **every key documented inline and
+all defaults shown**; that generated file is the reference. Use
+`--config <path>` to point at a different file.
 
-**`[filter]`** — what traffic is filtered and how strictly:
+| Section | What it controls |
+|---|---|
+| `[filter]` | What is inspected: port range, per-source/subnet/global connection windows, the verified-path abuse caps, username/version strictness, dry run, source-address policy. |
+| `[xdp]` | Attach mode (`"auto"`/`"driver"`/`"skb"`/`"offload"`) and the capacity of every in-kernel map (preallocated, so capacity is kernel memory). |
+| `[bedrock]` / `[voice]` | The opt-in UDP protocols: port, validation strictness (protocol/MTU windows) and the voice gate (verified-IP requirement). |
+| `[ingress]` | Optional default-deny for every port that is not explicitly opened, the `tc egress` flow tracking that backs the stateful pinhole, and the ICMP policy. |
+| `[blocklist]` | Manual blocklist file, the escalating auto-blocker (strikes, base/max TTL, decay) and the export file. |
+| `[[rules]]` | Declarative rules for arbitrary ports: TCP/UDP, allow/drop/rate, length bounds, magic bytes at an offset, stateful flag. `open_tcp_ports`/`open_udp_ports` sugar feeds the same engine. |
+| `[autotune]` | The optional limit auto-tuner: bounds, damping thresholds, interval, dry run (default on) and the state file. |
+| `[ml]` | The optional userspace risk scorer: mode `"off"`/`"shadow"`/`"enforce"`, threshold, model file, training. |
+| `[advisor]`, `[metrics]`, `[logging]` | Sizing/NIC recommendations, the Prometheus endpoint, log level and rotation. |
 
-| Option         | Type   | Default | Description |
-|----------------|--------|---------|-------------|
-| `start_port`   | int    | 25565   | First port of the inclusive filtered range. |
-| `end_port`     | int    | 25565   | Last port of the inclusive filtered range. |
-| `hit_count`    | int    | 10      | Max SYNs per source IP per throttle window (`0` disables throttling). |
-| `hit_count_reset_secs` | int | 3   | Throttle window length in seconds; each IP's SYN counter resets in-kernel once its window expires. |
-| `player_idle_timeout_secs` | int | 60 | Idle timeout for verified connections; an idle entry is removed in-kernel after one to two intervals, requiring a new handshake. |
-| `online_names` | bool   | true    | Enforce online-mode usernames (≤16 chars). |
-| `dry_run`      | bool   | false   | Count and log the drops the filter would make, but let every packet through. `minecraft_would_drop_reason` is published instead of `minecraft_drop_reason` while active. |
-| `drop_reserved_sources` | bool | true | Drop packets sourced from addresses that can never be a real client (0/8, 169.254/16, 224/4 multicast, 240/4). |
-| `drop_private_sources` | bool | false | Additionally drop RFC1918, loopback (127/8) and CGNAT (100.64/10) sources. Leave off when same-host proxies, LAN monitoring or other servers legitimately connect to the protected port. |
-
-**`[xdp]`** — how the program attaches and the capacity of its in-kernel tables
-(the maps are preallocated, so higher limits cost kernel memory up front):
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `mode` | string | `"auto"` | XDP attach mode: `"auto"` (native if the NIC supports it, automatic fallback to generic), `"driver"` (force native, fails when unsupported) or `"skb"` (force generic; works everywhere, slower). |
-| `max_pending_connections` | int | 16384 | Concurrent connections mid-handshake; the least-recently-used entry is evicted when full. |
-| `max_player_connections` | int | 65535 | Concurrent verified player connections; size well above the expected player count. |
-| `max_throttled_ips` | int | 65535 | Source IPs tracked by the SYN throttle; new SYNs are dropped while full (fail closed), until expired windows are reclaimed in-kernel. |
-| `allowlist_file` | string | (unset) | Text file with source addresses that skip all inspection: one IPv4 address or CIDR per line (`#` comments allowed). Read at start, re-read on `SIGHUP`. **Only for hosts you control** — source addresses can be spoofed unless the upstream filters them (uRPF/BCP38). |
-| `max_allowlist_entries` | int | 4096 | Capacity of the allowlist LPM trie; a file with more entries is rejected instead of truncated. |
-
-**`[metrics]`** — statistics collection and the Prometheus endpoint:
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enabled` | bool | false | Collect packet statistics inside the eBPF program. |
-| `addr` | string | (unset) | Address for the Prometheus HTTP endpoint (requires `enabled = true`). |
-| `poll_secs` | int | 10 | How often the in-kernel statistics are read and published. |
-
-**`[logging]`** — console and file logging:
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `level` | string | `"info"` | Verbosity: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"` or `"trace"`. Overridden by the `RUST_LOG` env variable. |
-| `file_max_mb` | int | 100 | Rotate `xdp-loader.log` once it grows past this size; the 5 newest rotated files are kept. |
+Every limit that can drop legitimate traffic has a mode that only counts
+(`dry_run`, `[autotune] dry_run`, `[ml] mode = "shadow"`), and the shipped
+defaults do not change the behavior of the filter for normal players: the new
+detections (`reject_proxy_header` aside) are opt-in.
 
 The `[filter]` values and map capacities are pushed into the eBPF program at
 load time (via `.rodata` globals and map definitions), so changing them only
@@ -149,7 +140,10 @@ requires a restart — **not a rebuild**.
 **Tuning with dry run.** Start with `dry_run = true` and watch
 `minecraft_would_drop_reason{reason=...}` while real players connect. Reasons
 that should stay at zero on a healthy server are listed in
-[`docs/deployment.md`](docs/deployment.md) together with what each one means.
+[`docs/deployment.md`](docs/deployment.md) together with what each one means;
+which reasons this build actually emits (the rest are reserved registry slots
+that no code path increments) is in
+[`docs/drop-reasons.md`](docs/drop-reasons.md).
 Turn dry run off once the counters look right.
 
 **Allowlist.** Sources listed in `allowlist_file` bypass the throttle and the
@@ -164,18 +158,46 @@ A failed reload leaves the previous entries in place and logs the error. Only
 allowlist addresses you really control: without upstream source-address
 filtering (uRPF/BCP38) an attacker can spoof an allowlisted address.
 
+**Network namespaces and tests.** `tests/e2e_loader.sh` builds a veth pair in a
+network namespace, loads the *real* object with every feature enabled, drives
+real traffic through it (valid players, status queries, Bedrock/voice, stateful
+pinhole, crafted attack shapes) and asserts on both what arrived and the drop
+reasons that moved:
+
+```bash
+cargo build --release && sudo ./tests/e2e_loader.sh
+```
+
 **Metrics.** With `enabled = true` and an `addr` set:
 
 ```
 minecraft_verified_connections          verified players since start
 minecraft_verified_packets              packets that took the verified fast path
 minecraft_syn_packets                   SYNs seen on the filtered ports
+minecraft_udp_packets                   UDP packets seen on the bedrock/voice ports
 minecraft_dropped_packets/bytes         drops and dropped volume
+minecraft_dropped_connections           connections killed by the filter
 minecraft_incoming_bytes                all bytes seen on the filtered ports
-minecraft_ipv6_packets                  IPv6 traffic passed unfiltered (see below)
+minecraft_state_switches                handshake state transitions
+minecraft_tcp_bypass                    SYNs that carried payload
+minecraft_egress_flows                  tracked egress flows (stateful pinhole)
+minecraft_egress_errors                 egress tracking/parse errors
+minecraft_ipv6_packets                  IPv6 traffic (also inspected, see the threat model)
 minecraft_drop_reason{reason="..."}     one counter per drop reason
-minecraft_dry_run                      1 while dry run is active
-minecraft_allowlist_entries            entries currently in the allowlist
+minecraft_would_drop_reason{...}        the same counters while dry run is active
+minecraft_dry_run                       1 while dry run is active
+minecraft_allowlist_entries             entries currently in the allowlist
+minecraft_blocklist_entries             manual blocklist entries
+minecraft_autoblock_entries             currently auto-blocked sources
+minecraft_limit_host_connections        live per-source connection limit
+minecraft_limit_subnet_connections      live per-subnet connection limit
+minecraft_limit_global_connections      live global connection limit
+minecraft_limit_udp_packets             live per-source UDP limit
+minecraft_limit_rule_packets            live rule-engine UDP limit
+minecraft_limit_strike_threshold        live strikes before auto-block
+minecraft_autotune_changes_total        limits actually changed by the auto-tuner
+minecraft_ml_top_score                  highest ML score in the last pass
+minecraft_ml_blocks_total               blocks applied by the ML enforcement pass
 ```
 
 ## Scope and limitations
@@ -183,21 +205,32 @@ minecraft_allowlist_entries            entries currently in the allowlist
 Honest summary; details and residual risks in
 [`docs/threat-model.md`](docs/threat-model.md):
 
-- **IPv4 TCP only.** IPv6, UDP, fragments and non-TCP traffic pass through
-  unfiltered (IPv6 is counted so this is visible). Bedrock/RakNet, Simple Voice
-  Chat and other UDP services are **not** protected yet — see
-  [`docs/roadmap.md`](docs/roadmap.md).
+- **Coverage is per port, not per host.** The Java range (default 25565) is
+  inspected on IPv4 and IPv6; Bedrock, voice and arbitrary ports are covered
+  only when enabled (`[bedrock]`, `[voice]`, `[[rules]]`, `[ingress]`). Every
+  other port passes untouched unless you turn on default-deny ingress.
+  Fragments aimed at an inspected port are dropped rather than reassembled, so
+  the fragments never carry uninspected data into the backend.
 - **Single host.** XDP filters what reaches *this* machine's NIC. It cannot
   absorb a volumetric flood that saturates the uplink; that needs upstream
   scrubbing, anycast or provider-side filtering. It *can* keep a saturated
-  uplink's attack traffic from reaching the Java server, and it does the L7
-  work (handshake validation, per-IP limits, verified fast path) that
+  uplink's attack traffic from reaching the server, and it does the L7 work
+  (handshake validation, per-IP/subnet/global limits, verified fast path) that
   network-layer filters cannot.
-- **No egress visibility.** Login/auth server spam (a valid login from a bot to
-  Mojang) cannot be stopped here; combine with Velocity/Paper
-  `connection-throttle` and online-mode auth.
+- **No authentication visibility.** A bot with a valid account that logs in
+  slowly still reaches your auth server: XDP sees the packets, not Mojang's
+  verdict. Combine with Velocity/Paper `connection-throttle`, online-mode auth
+  and per-account checks. The egress hook gives flow state, not identity.
+- **Default-deny is opt-in and depends on the egress hook.** With
+  `[ingress] default_deny = true` you must also enable `egress_tracking = true`
+  (the loader refuses the combination otherwise): a port is only reachable if
+  it is opened in the config or the host talked first. Test it with real
+  players, game consoles and monitoring before trusting it.
 - **Generic (`skb`) mode** sees coalesced GRO segments, so only the first
   segment of a burst is inspected; prefer native mode on the server NIC.
+- **ML is a heuristic, shadow by default.** The scorer is optional, trains on
+  this host's own labels and never blocks anything unless you set
+  `mode = "enforce"`; treat its output as a hint, not proof.
 - Stopping the loader detaches the filter (fail open). Run it under systemd.
 
 ## Troubleshooting

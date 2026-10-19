@@ -54,10 +54,16 @@ keeps players connected; it does not replace upstream scrubbing."*
 | `trafgen` (netsniff-ng) | cheap high-pps stateless floods (SYN, ACK, UDP, malformed) |
 | `pktgen` / `pktgen-dpdk` / TRex | line-rate stateless and stateful floods; DPDK variants bypass the sender's kernel |
 | `hping3 --flood -S -p 25565` | quick sanity SYN flood (with `--rand-source` to spoof, from a test network that permits it) |
-| `scapy` | crafted L7: bad VarInts, 0x00-only floods, oversized host, fragmented first bytes, TFO-with-data SYNs |
+| `scapy` | crafted L7: bad VarInts, 0x00-only floods, oversized host, fragmented first bytes, TFO-with-data SYNs, PROXY-protocol wrappers |
 | `mineflayer` / `mcstatus` / a small Rust/Go client | legitimate clients: status, login, offline-mode joins, version matrix |
 | `wrk`/`hey` against the metrics port | metrics endpoint overhead (must not affect the hot path) |
 | `perf top` / `bpftool prog profile` (if available) | per-instruction cost of the XDP program |
+
+The repository itself ships **no flood tool** on purpose. `tests/e2e_traffic.py`
+(used by `tests/e2e_loader.sh`) drives *bounded* versions of the S1/S3/S4/S10
+shapes with fixed counts inside a network namespace and asserts on the drop
+reasons; treat it as the regression gate for the parser and the counters, not
+as a load generator.
 
 ## 4. Metrics to capture
 
@@ -74,8 +80,9 @@ keeps players connected; it does not replace upstream scrubbing."*
 
 ### S1 — Volumetric SYN flood, single source
 `hping3 --flood -S -p 25565 <victim>`. Expect: most SYNs dropped by the
-throttle after `hit_count`; kernel stays healthy; a real client joining during
-the flood succeeds after the throttle window (or is dropped — record which).
+per-source window once it exceeds `host_connection_limit`; kernel stays healthy;
+a real client joining during the flood succeeds after the window (or is dropped
+— record which).
 Pass criteria: at least one topology (native mode) sustaining > 3 Mpps SYN
 with < 10 % dropped *legit* joins and JVM TPS ≥ 18.
 
@@ -89,17 +96,26 @@ from scrubbing networks: it measures how gracefully the filter degrades.
 ### S3 — Malformed / crafted floods
 Bad VarInt lengths, packet ID floods, empty-payload streams, TFO-with-data,
 first-fragment flood, impossible TCP flags (NULL/FIN+SYN/XMAS), ACK-only floods
-to the port with no tracked flow. Every category must map to a specific
+to the port with no tracked flow, and the crafted L7 shapes: `PROXY` v1 text
+and v2 signature wrappers, `next_state = 3`, an oversized hostname,
+unterminated/overlong VarInts, a frame whose declared length never arrives,
+the legacy pre-1.7 ping, a malformed RakNet offline handshake and an
+out-of-range voice type byte. Every category must map to a specific
 `minecraft_drop_reason`; a counter that does not move means a gap in the code
-(*this is the regression test for the parser*).
+(*this is the regression test for the parser*). The bounded version of this
+case is already automated in the netns e2e test (`probe_malformed` stage);
+only the load side has to be generated for a benchmark run.
 
 ### S4 — Valid-handshake / bot-join flood
 Script N clients (mineflayer with random offline names, or a raw-socket client
 that replays captured handshakes) joining as fast as possible from M source
 IPs. Measure: connections accepted per second, verified connections, JVM
-impact, and how many *real* player slots are consumed. Expect: the throttle
-caps per-IP joins; with many IPs the JVM is the bottleneck — that is T5, by
-design not solvable here.
+impact, and how many *real* player slots are consumed. Expect: the per-source
+window caps per-IP joins (`throttle_limit`), the per-subnet window caps one
+neighborhood, and with many IPs the JVM is the bottleneck — that is T5, by
+design not solvable here. Repeated per-source abuse additionally arms the
+auto-blocker, so record the block TTLs and the client-visible effect. The
+bounded single-source version (`login_burst`) is in the netns e2e test.
 
 ### S5 — Login-flood (auth spam) *impact* test
 Bots with real accounts logging in slowly. This documents the residual risk:
@@ -117,17 +133,20 @@ legit joins degrade, the pps at that point, and which resource saturates first
 (single CPU core? softirq? NIC queue? conntrack?). Document the curve.
 
 ### S8 — Map exhaustion
-Pre-fill `connection_throttle` to `max_throttled_ips` (spoofed sources),
+Pre-fill `host_throttle` to `max_throttled_ips` (spoofed sources),
 then test: (a) new SYNs are dropped via `throttle_state` (fail closed);
-(b) verified players keep playing; (c) capacity recovers after
-`hit_count_reset_secs` when the flood stops.
+(b) verified players keep playing; (c) capacity recovers after `window_ms`
+once the flood stops. Repeat with `subnet_throttle`/`global_rate`
+(`max_throttled_subnets`), `udp_throttle` (`rate_state`), `player_connection_map`
+(`verify_map_full`) and `egress_flows`, and record which map fails first.
 
 ### S9 — False-positive / compatibility matrix
 Each row: connect, list pings, join, play 30 s, disconnect — with the filter in
 dry-run first (expect zero `would_drop_reason` except `empty_ack`) then live.
 
-- Versions: 1.8 … 1.21.x plus the versions the README claims (`1.8 - 26.3`),
-  including the legacy-ping path.
+- Versions: 1.8 … 1.21.x plus the versions the README claims (the parser is
+  framing-based; current releases and snapshots are expected to work, the
+  legacy-ping path is rejected on purpose — record it).
 - Modes: online-mode and offline-mode; long reason strings (status), SRV
   hostnames, `host` containing `\0FML\0` (Forge), Fabric, modded handshakes.
 - Proxies: BungeeCord, Velocity (modern forwarding), Geyser (Java client →
@@ -136,9 +155,10 @@ dry-run first (expect zero `would_drop_reason` except `empty_ack`) then live.
 - Networking: MTU 1500 and 9000, VLAN tag present, fragmented *other* traffic
   must still pass (course, e.g. a large `ping -s 3000` to a different port),
   two clients behind one NAT (per-IP throttle fairness!), mobile client
-  reconnecting repeatedly, IPv6-only client (expected: unprotected → must be
-  documented and, if the host has AAAA records, resolved by upstream or the
-  roadmap).
+  reconnecting repeatedly, IPv6-only client (must be inspected like IPv4 and
+  join normally).
+- UDP (if enabled): Bedrock client joining through the filter, voice-chat
+  session during play, a Bedrock client behind the same NAT as a Java client.
 - Environment: server restart mid-run, loader restart mid-run (players keep
   connected? they must re-handshake), metrics scrape during attack.
 
@@ -177,7 +197,7 @@ plan limits, and whether they filter Minecraft UDP).
 ```
 Date / git revision:            <sha>
 Host:                           CPU model, cores, RAM, NIC model+driver, kernel
-Filter config:                  mode, start/end port, hit_count/window, map sizes, dry_run
+Filter config:                  mode, ports, host/subnet/global limits + window, new detections, map sizes, dry_run
 Attack:                         tool, packets/s (victim NIC counter), sources, duration
 Legit workload:                 clients/version/proxy, joins per minute
 Results:                        per test case S1..S11
