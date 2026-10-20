@@ -48,25 +48,47 @@ You can download the latest build from the Releases Tab
 Then just run the executable in sudo mode or via root
 
 ### Prerequisites
-- Rust toolchain (stable)
-- **System Dependencies**:
-  ```bash
-  sudo apt update
-  sudo apt install -y gcc-multilib wget gnupg software-properties-common git libbpf-dev
-  ```
-  If software-properties-common was not found remove it from the command.
-- **LLVM/Clang Toolchain**:
-  The build requires a recent LLVM version (CI uses LLVM 21).
-  ```bash
-  wget https://apt.llvm.org/llvm.sh
-  chmod +x llvm.sh
-  sudo ./llvm.sh 21 all
-  ```
+- Rust toolchain (stable) — `autobuild.sh` installs it with rustup when missing
+- clang/LLVM **14 or newer** (the eBPF program is built with `-mcpu=v3`)
+- libbpf development headers (`bpf/bpf_helpers.h`)
+- kernel uapi headers (`linux/bpf.h`, `asm/types.h`)
+
+The one-command way — checks all of the above, installs what is missing,
+builds the release loader and verifies that your kernel accepts the filter:
+
+```bash
+./autobuild.sh
+```
+
+It works with apt (Debian/Ubuntu), dnf (Fedora/RHEL), pacman (Arch) and
+zypper (openSUSE). `NOINSTALL=1 ./autobuild.sh` only reports what is missing
+instead of installing anything, and `XDP_BPF_INCLUDE=/prefix/include` points
+the build at libbpf headers in a non-standard location.
+
+Manual install (Ubuntu/Debian):
+
+```bash
+sudo apt update
+sudo apt install -y clang libbpf-dev linux-libc-dev git
+```
+
+`bpf/bpf_helpers.h` comes from libbpf's **development** package
+(`libbpf-dev`, `libbpf-devel`, `libbpf` on Arch), not from the kernel headers.
+If your distribution ships clang older than 14, install it from
+[apt.llvm.org](https://apt.llvm.org) (CI uses LLVM 21):
+
+```bash
+wget https://apt.llvm.org/llvm.sh
+chmod +x llvm.sh
+sudo ./llvm.sh 21 all
+```
 
 ### Build & Run
 1.  **Build the project**:
     ```bash
-    ./build.sh
+    ./autobuild.sh          # friendly: installs what is missing, builds, verifies
+    # or, with the dependencies already installed:
+    ./build.sh              # = cargo build --release
     ```
     The compiled binary will be at `target/release/xdp-loader`.
 

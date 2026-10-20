@@ -10,6 +10,7 @@ protected ports.
 |---|---|---|
 | Kernel | 5.15 | `bpf_timer` requires BTF; 6.x recommended (better verifier, XDP metadata) |
 | clang/LLVM | 14+ (`-mcpu=v3`) | only needed to build or to run the verifier check script |
+| libbpf headers | 1.x (`libbpf-dev` / `libbpf-devel`) | `bpf/bpf_helpers.h`; **not** part of the kernel headers, the most common build failure |
 | Rust | stable, edition 2024 | only needed to build from source |
 | Privileges | root / CAP_BPF + CAP_NET_ADMIN | loading the program, reading maps, SIGHUP target |
 | NIC | any | native XDP needs driver support; generic works everywhere |
@@ -17,11 +18,21 @@ protected ports.
 ## 2. Build and install
 
 ```bash
-# from source
+# from source, one command: checks/installs clang + libbpf headers + Rust,
+# builds the release loader and runs the kernel verifier self-check
+./autobuild.sh
+
+# or, with the dependencies already installed:
 cargo build --release               # builds xdp/minecraft_filter.o via build.rs
 sudo install -m755 target/release/xdp-loader /usr/local/bin/xdp-loader
 sudo ./xdp/tests/verifier_load.sh   # loads the object into the running kernel
 ```
+
+`autobuild.sh` is a no-op for anything already installed, so it is also the
+safe answer to "a build suddenly fails after an update". The loader only needs
+`libbpf` headers at **build** time; the shipped binary is statically linked.
+If the headers live in a non-standard prefix, set
+`XDP_BPF_INCLUDE=/prefix/include` (the build and the verifier script honour it).
 
 `cargo test` also runs the C parser unit tests. The verifier script loads the
 object with *default* values; the only gate that catches verifier rejections in
