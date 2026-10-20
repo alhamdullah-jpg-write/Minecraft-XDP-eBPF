@@ -1,11 +1,15 @@
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Compiles the eBPF program to `xdp/minecraft_filter.o`, which `loader/ebpf.rs`
 /// embeds into the loader binary at compile time, and derives the drop-reason
 /// metric labels from `xdp/stats.h`.
 fn main() {
+    // changing either of these must retrigger the build
+    println!("cargo:rerun-if-env-changed=CLANG");
+    println!("cargo:rerun-if-env-changed=XDP_BPF_INCLUDE");
+
     // explicit file list on purpose: watching the whole xdp/ directory would
     // also watch the generated .o and recompile on every build
     for source in [
@@ -30,7 +34,16 @@ fn main() {
 
     generate_drop_reason_names();
 
-    let mut command = Command::new(std::env::var("CLANG").unwrap_or_else(|_| "clang".into()));
+    // the bpf helpers come from libbpf's development headers, which are not
+    // part of the kernel uapi and therefore not guaranteed to be installed:
+    // fail with the install command before clang fails with a bare
+    // "bpf_helpers.h file not found"
+    let Some(extra_includes) = bpf_include_dirs() else {
+        panic!("{}", missing_bpf_headers_hint());
+    };
+
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let mut command = Command::new(&clang);
     command.args([
         "-Wall",
         "-Wextra",
@@ -44,20 +57,100 @@ fn main() {
     for path in multiarch_include_paths() {
         command.arg("-idirafter").arg(path);
     }
-    let output = command
+    // only added when the headers are *not* in clang's default search path,
+    // and as system headers so -Wall never reports warnings from libbpf itself
+    for path in &extra_includes {
+        command.arg("-isystem").arg(path);
+    }
+    let output = match command
         .args(["-c", "minecraft_filter.c", "-o", "minecraft_filter.o"])
         .current_dir("xdp")
         .output()
-        .expect("failed to run clang, is LLVM/clang installed?");
+    {
+        Ok(output) => output,
+        Err(error) => panic!(
+            "failed to run '{clang}': {error}\n\
+             install LLVM/clang (at least version 14; -mcpu=v3 needs it) or set \
+             the CLANG environment variable to the binary to use"
+        ),
+    };
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let hint = if stderr.contains("bpf_helpers.h")
+            || stderr.contains("bpf_helper_defs.h")
+            || stderr.contains("'bpf/")
+        {
+            format!("\n{}", missing_bpf_headers_hint())
+        } else {
+            String::new()
+        };
         panic!(
-            "clang compilation failed:\nstdout: {}\nstderr: {}",
+            "clang compilation failed:\nstdout: {}\nstderr: {stderr}{hint}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
+
+/// Include roots that provide libbpf's `bpf/bpf_helpers.h`, as `-isystem`
+/// arguments. `None` means the headers were not found anywhere: the caller
+/// must fail with an install hint, because clang would fail with a bare
+/// "file not found".
+///
+/// `/usr/include` and `/usr/local/include` are already searched by clang, so
+/// they are checked (to decide whether the build can work at all) but not
+/// returned - adding them as `-isystem` would only change the warning
+/// classification of unrelated headers. Anything listed in `XDP_BPF_INCLUDE`
+/// (colon separated) is returned, so a from-source or relocated libbpf can be
+/// used without touching the system.
+fn bpf_include_dirs() -> Option<Vec<PathBuf>> {
+    let mut found_in_default_path = false;
+    let mut extra = Vec::new();
+    if let Some(value) = std::env::var_os("XDP_BPF_INCLUDE") {
+        for part in std::env::split_paths(&value) {
+            if part.join("bpf/bpf_helpers.h").is_file() {
+                extra.push(part);
+            } else {
+                eprintln!(
+                    "note: XDP_BPF_INCLUDE entry '{}' has no bpf/bpf_helpers.h",
+                    part.display()
+                );
+            }
+        }
+    }
+    for root in ["/usr/include", "/usr/local/include"] {
+        if Path::new(root).join("bpf/bpf_helpers.h").is_file() {
+            found_in_default_path = true;
+        }
+    }
+    if found_in_default_path || !extra.is_empty() {
+        Some(extra)
+    } else {
+        None
+    }
+}
+
+/// The message shown when the libbpf headers are missing: one install command
+/// per distribution plus the escape hatches.
+fn missing_bpf_headers_hint() -> String {
+    "bpf/bpf_helpers.h was not found, so the eBPF object can not be compiled.\n\
+     \n\
+     It ships in libbpf's development headers, not in the kernel headers:\n\
+       Ubuntu/Debian:  apt-get install -y libbpf-dev\n\
+       Fedora/RHEL:    dnf install -y libbpf-devel\n\
+       Arch:           pacman -S libbpf\n\
+       openSUSE:       zypper install libbpf-devel\n\
+       from source:    https://github.com/libbpf/libbpf (install to /usr/local)\n\
+     \n\
+     If they are installed in a non-standard prefix, add that prefix:\n\
+       XDP_BPF_INCLUDE=/opt/libbpf/include cargo build --release\n\
+     \n\
+     You do not need any of this to *run* the filter: the release archives and\n\
+     the prebuilt/ directory of the source zip ship a statically linked loader\n\
+     with the compiled object already embedded."
+        .to_string()
+}
+
 
 /// Generates `drop_reasons.rs` in OUT_DIR from the `enum drop_reason` in
 /// `xdp/stats.h`: the Prometheus label of every reason, indexed by its enum

@@ -48,6 +48,12 @@ extra=()
 for dir in /usr/include/*-linux-gnu; do
     [ -d "$dir" ] && extra+=("-idirafter" "$dir")
 done
+# relocated libbpf headers, exactly like build.rs honours them
+if [ -n "${XDP_BPF_INCLUDE:-}" ]; then
+    while IFS= read -r dir; do
+        [ -d "$dir" ] && extra+=("-isystem" "$dir")
+    done < <(printf '%s' "$XDP_BPF_INCLUDE" | tr ':' '\n')
+fi
 
 if ! clang -Wall -Wextra -Wno-language-extension-token -O2 -g -target bpf -mcpu=v3 \
     "${extra[@]}" -c "$root/xdp/minecraft_filter.c" -o "$obj"; then
